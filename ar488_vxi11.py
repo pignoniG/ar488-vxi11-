@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import signal
+import termios
 import sys
 import threading
 import time
@@ -45,6 +46,91 @@ class AdapterError(Exception):
     pass
 
 
+# termios.error (e.g. EIO on an unplugged port) is not an OSError subclass
+SERIAL_ERRORS = (serial.SerialException, OSError, termios.error)
+
+
+# ---- finding adapters by the name stored in them (++id name) ---------------
+# Opening a serial port resets the Arduino in an AR488, so never probe a port
+# that an adapter is using: PORTS_IN_USE holds their real device paths.
+SERIAL_DIR = "/dev/serial/by-path"
+PORT_LOCK = threading.Lock()
+PORTS_IN_USE = set()
+DISCOVERY_LOCK = threading.Lock()
+_discovered = {}            # stored name -> port path, from the last probe
+_discovered_at = 0.0
+DISCOVERY_MAX_AGE_S = 15
+
+
+def _line_query(ser, line, timeout=1.0):
+    ser.reset_input_buffer()
+    ser.write(line.encode("ascii") + b"\n")
+    deadline = time.monotonic() + timeout
+    buf = b""
+    while time.monotonic() < deadline:
+        buf += ser.read(ser.in_waiting or 1)
+        if buf.endswith(b"\n"):
+            break
+    return buf.decode("ascii", "replace").strip()
+
+
+def probe_port(path, baud=115200, reset_delay=2.5):
+    """(version, stored name) of the AR488 on path, or None if it isn't one."""
+    try:
+        with serial.Serial(path, baud, timeout=0.2, write_timeout=2) as s:
+            time.sleep(reset_delay)
+            ver = _line_query(s, "++ver", 2.0)
+            if "AR488" not in ver:
+                return None
+            return ver, _line_query(s, "++id name")
+    except SERIAL_ERRORS:
+        return None
+
+
+def free_ports():
+    if not os.path.isdir(SERIAL_DIR):
+        return []
+    with PORT_LOCK:
+        busy = set(PORTS_IN_USE)
+    ports = (os.path.join(SERIAL_DIR, p) for p in sorted(os.listdir(SERIAL_DIR)))
+    return [p for p in ports if os.path.realpath(p) not in busy]
+
+
+def discover(force=False):
+    """Probe all free USB serial ports in parallel. Returns {path: (version, name)}
+    and refreshes the name -> path cache used by locate()."""
+    global _discovered, _discovered_at
+    ports = free_ports()
+    results = {}
+
+    def worker(p):
+        r = probe_port(p)
+        if r:
+            results[p] = r
+    threads = [threading.Thread(target=worker, args=(p,)) for p in ports]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    _discovered = {name.lower(): p for p, (_, name) in results.items() if name}
+    _discovered_at = time.monotonic()
+    for p, (ver, name) in sorted(results.items()):
+        log.info("found AR488 %r on %s (%s)", name or "<no name>", p, ver)
+    return results
+
+
+def locate(name):
+    """Port of the adapter whose stored name is `name`."""
+    with DISCOVERY_LOCK:
+        fresh = time.monotonic() - _discovered_at < DISCOVERY_MAX_AGE_S
+        p = _discovered.get(name) if fresh else None
+        if p and p in free_ports():
+            return p
+        discover()
+        p = _discovered.get(name)
+        if not p:
+            raise AdapterError(f"{name}: no adapter with stored name {name!r} found")
+        return p
+
+
 class ReadTimeout(Exception):
     pass
 
@@ -69,30 +155,64 @@ class AR488Adapter:
         self.lock = threading.Lock()
         self.ser = None
         self.version = None
+        self.current_port = None  # port actually in use (self.port may be None)
+        self._real = None
         self._addr = None
         self._eoi = None
         self._tmo = None
 
     # ---- low level -------------------------------------------------------
     def open(self):
+        """Open the adapter. With no fixed port, find it by the name stored in
+        it (++id name). Either way, refuse an adapter that reports another name."""
         self.close()
-        log.info("%s: opening %s", self.name, self.port)
-        ser = serial.Serial(self.port, self.baud, timeout=0.5, write_timeout=5)
-        time.sleep(self.reset_delay)          # Arduino resets on open (DTR)
-        ser.reset_input_buffer()
-        self.ser = ser
-        self._addr = self._eoi = self._tmo = None
-        self.version = self._query("++ver", 2.0)
-        if "AR488" not in self.version:
-            log.warning("%s: unexpected ++ver reply %r", self.name, self.version)
+        port = self.port or locate(self.name)
+        real = os.path.realpath(port)
+        with PORT_LOCK:
+            if real in PORTS_IN_USE:
+                raise AdapterError(f"{self.name}: {port} is already used by another bus")
+            PORTS_IN_USE.add(real)
+        self._real = real
+        try:
+            log.info("%s: opening %s", self.name, port)
+            ser = serial.Serial(port, self.baud, timeout=0.5, write_timeout=5)
+            self.ser = ser
+            time.sleep(self.reset_delay)          # Arduino resets on open (DTR)
+            ser.reset_input_buffer()
+            self._addr = self._eoi = self._tmo = None
+            self.version = self._query("++ver", 2.0)
+            if "AR488" not in self.version:
+                log.warning("%s: unexpected ++ver reply %r", self.name, self.version)
+            stored = self._query("++id name")
+            if stored and stored.lower() != self.name:
+                raise AdapterError(f"{self.name}: the adapter on {port} is named {stored!r}, "
+                                   f"not {self.name!r} (moved to another USB socket?)")
+            if not stored:
+                log.warning("%s: adapter on %s has no stored name; to pin it, send "
+                            "'++id name %s' and '++savecfg' to it", self.name, port, self.name)
+            self.current_port = port
+        except BaseException:
+            self.close()
+            raise
         # controller mode, no auto-read, assert EOI on last byte, send data
         # verbatim (client supplies its own terminator), mark EOI with EOT byte.
-        for c in ("++mode 1", "++auto 0", "++eos 3", "++eot_enable 1",
-                  f"++eot_char {EOT}"):
-            self._cmd(c)
-        self._set_eoi(True)
-        if self.ifc_on_open:
-            self._cmd("++ifc")
+        # One command at a time, each confirmed: the AR488 has no flow control
+        # and a 64-byte input buffer, so a burst can be partly dropped.
+        try:
+            setup = ["++mode 1", "++auto 0", "++eos 3", "++eot_enable 1", f"++eot_char {EOT}", "++eoi 1"]
+            if self.ifc_on_open:
+                setup.append("++ifc")
+            for c in setup:
+                self._cmd(c)
+                if not self._query("++addr", 2.0).isdigit():
+                    raise AdapterError(f"{self.name}: no answer during setup ({c})")
+            got = [self._query(q) for q in ("++mode", "++auto", "++eos", "++eot_enable", "++eot_char", "++eoi")]
+            if got != ["1", "0", "3", "1", str(EOT), "1"]:
+                raise AdapterError(f"{self.name}: setup not applied, adapter reports {got}")
+            self._eoi = True
+        except BaseException:
+            self.close()
+            raise
         log.info("%s: ready, %s", self.name, self.version)
 
     def close(self):
@@ -102,28 +222,24 @@ class AR488Adapter:
             except Exception:
                 pass
         self.ser = None
+        self.current_port = None
+        if self._real:
+            with PORT_LOCK:
+                PORTS_IN_USE.discard(self._real)
+            self._real = None
 
     def _ensure_open(self):
         if self.ser is None:
             try:
                 self.open()
-            except (serial.SerialException, OSError) as e:
-                self.ser = None
-                raise AdapterError(f"{self.name}: cannot open {self.port}: {e}")
+            except SERIAL_ERRORS as e:
+                raise AdapterError(f"{self.name}: cannot open {self.port or 'adapter'}: {e}")
 
     def _cmd(self, line):
         self.ser.write(line.encode("ascii") + b"\n")
 
     def _query(self, line, timeout=1.0):
-        self.ser.reset_input_buffer()
-        self._cmd(line)
-        deadline = time.monotonic() + timeout
-        buf = b""
-        while time.monotonic() < deadline:
-            buf += self.ser.read(self.ser.in_waiting or 1)
-            if buf.endswith(b"\n"):
-                break
-        return buf.decode("ascii", "replace").strip()
+        return _line_query(self.ser, line, timeout)
 
     def _set_addr(self, addr):
         if self._addr != addr:
@@ -148,7 +264,7 @@ class AR488Adapter:
             self._ensure_open()
             try:
                 return fn(*args)
-            except (serial.SerialException, OSError) as e:
+            except SERIAL_ERRORS as e:
                 log.error("%s: serial error: %s", self.name, e)
                 self.close()
                 raise AdapterError(str(e))
@@ -187,7 +303,10 @@ class AR488Adapter:
                 raise AdapterError(f"{self.name}: adapter stopped responding (GPIB handshake stuck?)")
             buf += self.ser.read(self.ser.in_waiting or 1)
         if buf.strip() != str(self._addr).encode():
-            log.warning("%s: unexpected sync reply %r", self.name, buf)
+            # Some bytes were lost or garbled: the adapter's state is unknown.
+            # Forget the cached settings so they are sent again, and fail this call.
+            self._addr = self._eoi = self._tmo = None
+            raise AdapterError(f"{self.name}: unexpected sync reply {buf!r}, data may not have arrived")
 
     def read(self, addr, timeout_s):
         return self._run(self._read, addr, timeout_s)
@@ -347,7 +466,7 @@ class GatewayInfoDevice(Vxi11.InstrumentDevice):
         if cmd == "*IDN?":
             self.result = f"AR488-VXI11,Gateway,{os.uname().nodename},{VERSION}\n"
         elif cmd in ("*DEVICE_LIST?", "INTERFACES?"):
-            self.result = ",".join(f"{n}={a.port}" for n, a in sorted(ADAPTERS.items())) + "\n"
+            self.result = ",".join(f"{n}={a.current_port or 'NOT FOUND'}" for n, a in sorted(ADAPTERS.items())) + "\n"
         elif cmd == "VERSIONS?":
             self.result = ";".join(f"{n}={a.version}" for n, a in sorted(ADAPTERS.items())) + "\n"
         elif cmd.startswith("LISTENERS?"):
@@ -411,11 +530,20 @@ def load_config(path):
             cfg = tomllib.load(f)
     ifaces = cfg.get("interface", [])
     if not ifaces:
-        # auto-detect: every USB serial port, ordered by physical USB port
-        d = "/dev/serial/by-path"
-        ports = sorted(os.path.join(d, p) for p in os.listdir(d)) if os.path.isdir(d) else []
-        ifaces = [{"name": f"gpib{i}", "port": p} for i, p in enumerate(ports)]
-        log.info("no [[interface]] in config, auto-detected %d port(s)", len(ifaces))
+        # auto-detect every AR488: named ones by their stored name, unnamed
+        # ones get the next free gpibN, pinned to their physical USB port
+        with DISCOVERY_LOCK:
+            found = discover()
+        names = {n.lower() for _, n in found.values() if n}
+        ifaces = [{"name": n} for n in sorted(names)]
+        i = 0
+        for p, (_, n) in sorted(found.items()):
+            if not n:
+                while f"gpib{i}" in names:
+                    i += 1
+                names.add(f"gpib{i}")
+                ifaces.append({"name": f"gpib{i}", "port": p})
+        log.info("no [[interface]] in config, auto-detected %d adapter(s)", len(ifaces))
     return cfg.get("server", {}), ifaces
 
 
@@ -435,7 +563,7 @@ def main():
         logging.getLogger(lib).setLevel(logging.DEBUG if args.verbose else logging.WARNING)
 
     for i in ifaces:
-        a = AR488Adapter(i["name"].lower(), i["port"], i.get("baud", 115200),
+        a = AR488Adapter(i["name"].lower(), i.get("port"), i.get("baud", 115200),
                          i.get("reset_delay", 2.5), i.get("ifc_on_open", True),
                          i.get("no_eoi", []), i.get("auto_no_eoi", True),
                          i.get("no_eoi_tmo_ms", NO_EOI_TMO_MS))
@@ -452,7 +580,7 @@ def main():
     IS.Vxi11Server._device_registry = GatewayRegistry()
     server = Vxi11.InstrumentServer(GatewayInfoDevice)
     server.listen()
-    log.info("VXI-11 gateway up: %s", ", ".join(f"{n} -> {a.port}" for n, a in sorted(ADAPTERS.items())))
+    log.info("VXI-11 gateway up: %s", ", ".join(f"{n} -> {a.current_port or 'NOT FOUND'}" for n, a in sorted(ADAPTERS.items())))
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())

@@ -16,7 +16,7 @@ TCPIP::<pi-ip>::inst0::INSTR         # the gateway itself (see "Gateway queries"
 |---|---|
 | `ar488_vxi11.py` | the gateway (AR488 serial driver + VXI-11 device handlers) |
 | `vxi11_server/` | vendored [python-vxi11-server](https://github.com/coburnw/python-vxi11-server) @52ecfba, patched (see below) |
-| `ar488-vxi11.toml` | config → `/etc/ar488-vxi11.toml` (bus names ↔ serial ports) |
+| `ar488-vxi11.toml` | config → `/etc/ar488-vxi11.toml` (buses and per-bus options) |
 | `ar488-vxi11.service` | systemd unit (runs as user `ar488gw`, group `dialout`) |
 | `install.sh` | installs to `/opt/ar488-vxi11`, enables rpcbind + the service |
 | `test_client.py` | PyVISA client for testing / scanning a bus over the network |
@@ -28,15 +28,31 @@ TCPIP::<pi-ip>::inst0::INSTR         # the gateway itself (see "Gateway queries"
 journalctl -u ar488-vxi11 -f
 ```
 
-`install.sh` won't overwrite an existing `/etc/ar488-vxi11.toml`. Edit that file to change mappings.
+`install.sh` won't overwrite an existing `/etc/ar488-vxi11.toml`. Edit that file to change settings.
 
 ## Adapters and instruments
 
-| bus | adapter | firmware | pinned by |
-|---|---|---|---|
-| gpib0 | Nano clone, CH340 (no USB serial no.) | AR488 0.53.46, patched | physical USB port `1.4.3`, so keep it in that socket |
-| gpib1 | Nano original, FTDI FT232R `AC008SFE` | AR488 0.53.46, patched | USB serial number, any socket works |
-| gpib2 | Nano clone, CH340 (no USB serial no.) | AR488 0.53.46, patched | physical USB port `1.4.2`, so keep it in that socket |
+| bus | adapter | firmware |
+|---|---|---|
+| gpib0 | Nano clone, CH340 | AR488 0.53.46, patched |
+| gpib1 | Nano original, FTDI FT232R `AC008SFE` | AR488 0.53.46, patched |
+| gpib2 | Nano clone, CH340 | AR488 0.53.46, patched |
+
+**Each adapter carries its bus name** in its own EEPROM (`++id name`). At
+startup the gateway probes every USB serial port and assigns buses by the
+stored name, so adapters can go in any USB socket and boot order doesn't
+matter. An adapter that reports a different name from the bus it would be
+opened as is refused (also when a `port` is pinned in the config).
+
+To name a new adapter (once, with the gateway stopped):
+
+```
+sudo systemctl stop ar488-vxi11
+python3 -c "import serial,time; s=serial.Serial('/dev/ttyUSB0',115200); time.sleep(2.5); s.write(b'++id name gpib3\n++savecfg\n'); time.sleep(0.5)"
+```
+
+then add `[[interface]] name = "gpib3"` to `/etc/ar488-vxi11.toml` and start the
+gateway again.
 
 All adapters use SN75160/SN75161 bus drivers (TE = D6, DC = D13). The firmware
 source, build script, patches and backups of the original firmware are in
@@ -85,8 +101,15 @@ replies end at normal speed. `no_eoi` can stay set either way.
   sets END.
 * A lock per bus serialises access, so several clients and instruments can share
   an adapter. VXI-11 `lock()`/`unlock()` work per instrument.
-* If an adapter is unplugged, the next access fails with an I/O error, and the
-  port reopens automatically once it is back.
+* If an adapter is unplugged, accesses to that bus fail with an I/O error. The
+  first access after it is plugged back in (into any socket) finds it again by
+  name and reopens it, which takes about 5 s. Only ports no other bus is using are
+  probed, because opening a port resets its Arduino. Other buses keep working
+  throughout (tested 2026-11-07 by detaching and re-attaching the USB device).
+* After opening an adapter, each setup command is confirmed before the next is
+  sent. If a write's confirmation ever comes back wrong, the gateway forgets the
+  adapter's cached state and returns an I/O error rather than risk sending to
+  the wrong address.
 * VXI-11 ops → AR488: write/read, `read_stb` → `++spoll`, `clear` → `++clr`,
   `trigger` → `++trg`, `local` → `++loc`.
 
