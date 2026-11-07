@@ -243,6 +243,18 @@ class AR488Adapter:
                 raise AdapterError(f"bad spoll reply {r!r}")
         return self._run(f)
 
+    def find_listeners(self):
+        """Addresses that acknowledge as listeners on the bus (GPIB-level check,
+        works for instruments that answer no queries). Needs AR488 >= 0.53."""
+        def f():
+            r = self._query("++fndl all", 5.0)
+            if not r:
+                return []
+            if not re.fullmatch(r"[0-9:,]+", r):
+                raise AdapterError(f"++fndl not supported by {self.version or 'firmware'} ({r!r})")
+            return r.split(",")
+        return self._run(f)
+
     def simple(self, addr, cmd):
         def f():
             self._set_addr(addr)
@@ -336,8 +348,24 @@ class GatewayInfoDevice(Vxi11.InstrumentDevice):
             self.result = f"AR488-VXI11,Gateway,{os.uname().nodename},{VERSION}\n"
         elif cmd in ("*DEVICE_LIST?", "INTERFACES?"):
             self.result = ",".join(f"{n}={a.port}" for n, a in sorted(ADAPTERS.items())) + "\n"
+        elif cmd == "VERSIONS?":
+            self.result = ";".join(f"{n}={a.version}" for n, a in sorted(ADAPTERS.items())) + "\n"
+        elif cmd.startswith("LISTENERS?"):
+            # LISTENERS?            -> gpib0=16;gpib1=9,22
+            # LISTENERS? gpib1      -> gpib1=9,22
+            want = cmd[len("LISTENERS?"):].strip().lower()
+            parts = []
+            for n, a in sorted(ADAPTERS.items()):
+                if want and n != want:
+                    continue
+                try:
+                    parts.append(f"{n}=" + ",".join(a.find_listeners()))
+                except AdapterError as e:
+                    log.info("%s", e)
+                    parts.append(f"{n}=UNSUPPORTED" if "not supported" in str(e) else f"{n}=ERROR")
+            self.result = (";".join(parts) if parts else f"ERROR: no interface {want}") + "\n"
         else:
-            self.result = "ERROR: supported: *IDN?, INTERFACES?\n"
+            self.result = "ERROR: supported: *IDN?, INTERFACES?, VERSIONS?, LISTENERS? [gpibN]\n"
         self.result = self.result.encode()
         return V.ERR_NO_ERROR
 
