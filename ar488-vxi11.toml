@@ -19,6 +19,11 @@ name = "gpib1"
 port = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AC008SFE-if00-port0"
 no_eoi = [9]            # HP 3245A: no EOI on replies unless sent "END ON"
 
+# CH340-based adapter (Nano clone, added 2026-11-07), pinned by physical USB port
+[[interface]]
+name = "gpib2"
+port = "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4.2:1.0-port0"
+
 # Optional per-interface settings:
 # baud = 115200
 # reset_delay = 2.5     # seconds to wait after opening (Arduino resets on open)

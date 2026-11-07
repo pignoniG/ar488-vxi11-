@@ -34,15 +34,19 @@ journalctl -u ar488-vxi11 -f
 
 | bus | adapter | firmware | pinned by |
 |---|---|---|---|
-| gpib0 | Nano clone, CH340 (no USB serial no.) | AR488 0.53.46, patched (see ../ar488-firmware) | physical USB port `1.4.3`, so keep it in that socket |
-| gpib1 | Nano original, FTDI FT232R `AC008SFE` | AR488 0.51.15 | USB serial number, any socket works |
+| gpib0 | Nano clone, CH340 (no USB serial no.) | AR488 0.53.46, patched | physical USB port `1.4.3`, so keep it in that socket |
+| gpib1 | Nano original, FTDI FT232R `AC008SFE` | AR488 0.53.46, patched | USB serial number, any socket works |
+| gpib2 | Nano clone, CH340 (no USB serial no.) | AR488 0.53.46, patched | physical USB port `1.4.2`, so keep it in that socket |
 
-Both adapters use SN75160/SN75161 bus drivers (TE = D6, DC = D13).
+All adapters use SN75160/SN75161 bus drivers (TE = D6, DC = D13). The firmware
+source, build script, patches and backups of the original firmware are in
+`~/Documents/ar488-firmware` on the Pi (not in this repo).
 
-**Firmware requirements:** the gateway works with 0.51.15 and with 0.53.46
-*only with the EOT patch*. Stock 0.53.46 sends the end-of-reply marker as the
-text `4` instead of byte 0x04, so every read would hang until timeout.
-`LISTENERS?` needs 0.53 or newer.
+**Firmware requirements:** the gateway works with 0.51.x, and with 0.53.46 *only
+with two patches*. Stock 0.53.46 sends the end-of-reply marker as the text `4`
+instead of byte 0x04, so every read would hang until timeout. Its `++fndl` also
+leaves the bus in a state where the next write is lost. `LISTENERS?` needs 0.53
+or newer.
 
 ## Gateway queries (`inst0`)
 
@@ -53,13 +57,15 @@ text `4` instead of byte 0x04, so every read would hang until timeout.
 | `VERSIONS?` | AR488 firmware version of each adapter |
 | `LISTENERS?` / `LISTENERS? gpib0` | addresses that acknowledge on the bus, e.g. `gpib0=16;gpib1=9,22`. This is a GPIB-level check, so it finds instruments that answer no queries (HP 3456A). Takes ~0.15 s per bus. An adapter on old firmware reports `UNSUPPORTED`. |
 
-Tested through the gateway (PyVISA/pyvisa-py over the LAN, 2026-11-07):
+Tested through the gateway (PyVISA/pyvisa-py over the LAN, 2026-11-07, all
+four in parallel as well):
 
 | resource | instrument | notes |
 |---|---|---|
 | `gpib0,16` | Keithley 2000 | SCPI. ~100 ms per `READ?` at 1 PLC. 12 s averaged readings work. |
 | `gpib1,9` | HP 3245A | `ID?`, `ERR?`. Sends no EOI by default, see below. |
-| `gpib1,22` | HP 3456A | No queries: send e.g. `H F1 R1 T4`, then `T3` and read. ASCII and packed (`P1`) binary readings work. **Serial poll does not work** (see limitations). |
+| `gpib1,22` | HP 3456A | No queries: send e.g. `H F1 R1 T4`, then `T3` and read. ASCII and packed (`P1`) binary readings and serial poll work. |
+| `gpib2,8` | Agilent 54624A | SCPI. 1000-byte binary waveform (`:WAV:DATA?`) in about 1 s. |
 
 **HP 3245A:** it doesn't assert EOI unless told to. The gateway handles this
 (`no_eoi = [9]` in the config) by ending its replies after 200 ms of silence,
@@ -93,11 +99,8 @@ replies end at normal speed. `no_eoi` can stay set either way.
   pyvisa-py never asks the server to wait for a lock, so with pyvisa-py
   `lock_excl()` fails at once while another client holds it: retry it in a loop.
   NI-VISA waits up to its lock timeout.
-* **Serial poll (`read_stb`) of the HP 3456A fails** with an I/O error after
-  2 s. The AR488 firmware (0.51.15) never answers `++spoll 22`, even on the bare
-  serial port, while polls of other instruments on the same bus work. Not yet
-  tested with 0.53.46 (gpib1 still runs 0.51.15). Until then, just trigger and
-  read the 3456A.
+* Serial poll of the HP 3456A only works with AR488 0.53. Firmware 0.51.15
+  never answered `++spoll` for it.
 * The adapter has no serial flow control and a 64-byte buffer. The gateway
   therefore waits for each 48-byte chunk to be written (an `++addr` round trip)
   before sending more. This costs a few ms per 48 bytes (upload speed not measured).
