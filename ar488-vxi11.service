@@ -1,0 +1,21 @@
+[Unit]
+Description=AR488 GPIB adapters exposed as VXI-11 network instruments
+Wants=rpcbind.service
+After=rpcbind.service network-online.target
+
+[Service]
+Type=simple
+User=ar488gw
+Group=dialout
+# openocd/flashrom udev rules put FTDI serial adapters in plugdev, not dialout
+SupplementaryGroups=plugdev
+ExecStart=/usr/bin/python3 /opt/ar488-vxi11/ar488_vxi11.py -c /etc/ar488-vxi11.toml
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

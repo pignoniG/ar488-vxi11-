@@ -1,0 +1,29 @@
+# AR488 -> VXI-11 gateway configuration (installed as /etc/ar488-vxi11.toml)
+#
+# Each [[interface]] is one AR488 adapter = one GPIB bus. Clients address
+# instruments as  TCPIP::<pi>::<name>,<gpib address>::INSTR
+# If no [[interface]] entries exist, every /dev/serial/by-path port is used,
+# ordered by physical USB port.
+
+[server]
+log_level = "INFO"      # DEBUG logs every command/response
+
+# CH340-based adapter (no USB serial number, so pinned by physical USB port)
+[[interface]]
+name = "gpib0"
+port = "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4.3:1.0-port0"
+
+# FTDI-based adapter (pinned by its USB serial number, any port works)
+[[interface]]
+name = "gpib1"
+port = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AC008SFE-if00-port0"
+no_eoi = [9]            # HP 3245A: no EOI on replies unless sent "END ON"
+
+# Optional per-interface settings:
+# baud = 115200
+# reset_delay = 2.5     # seconds to wait after opening (Arduino resets on open)
+# ifc_on_open = true    # pulse IFC when the adapter is opened
+# no_eoi = [9, 22]      # addresses that never assert EOI on replies; their reads
+#                       # end after no_eoi_tmo_ms of silence instead
+# no_eoi_tmo_ms = 200
+# auto_no_eoi = true    # detect such instruments automatically (first read ~3 s)
