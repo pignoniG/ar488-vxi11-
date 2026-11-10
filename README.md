@@ -71,7 +71,7 @@ or newer.
 | `*IDN?` | `AR488-VXI11,Gateway,<host>,<version>` |
 | `INTERFACES?` | `gpib0=<serial port>,gpib1=<serial port>` |
 | `VERSIONS?` | AR488 firmware version of each adapter |
-| `LISTENERS?` / `LISTENERS? gpib0` | addresses that acknowledge on the bus, e.g. `gpib0=16;gpib1=9,22`. This is a GPIB-level check, so it finds instruments that answer no queries (HP 3456A). Takes ~0.15 s per bus. An adapter on old firmware reports `UNSUPPORTED`. |
+| `LISTENERS?` / `LISTENERS? gpib0` | addresses that acknowledge on the bus, e.g. `gpib0=16;gpib1=9,22`. This is a GPIB-level check, so it finds instruments that answer no queries (HP 3456A). All buses are scanned at once (~0.2 s). A bus with nothing powered on gives an empty list (`gpib2=`). An adapter on old firmware reports `UNSUPPORTED`. |
 
 Tested through the gateway (PyVISA/pyvisa-py over the LAN, 2026-11-07, all
 four in parallel as well):
@@ -99,8 +99,13 @@ replies end at normal speed. `no_eoi` can stay set either way.
 * Data bytes LF/CR/ESC/`+` are ESC-escaped, so binary writes are safe. Writes
   go out in 48-byte lines, with EOI only on the last byte when the client
   sets END.
-* A lock per bus serialises access, so several clients and instruments can share
-  an adapter. VXI-11 `lock()`/`unlock()` work per instrument.
+* **Several clients at once.** Each bus has its own lock, so instruments on
+  different adapters are used fully in parallel: a slow measurement on gpib1
+  doesn't delay gpib0 (tested: gpib0 `*IDN?` in 0.04 s while gpib1 waits on a
+  read). This holds whether the client opens one TCP connection per instrument
+  (pyvisa-py, python-vxi11) or puts several instruments on one connection (VISA
+  libraries may do this). Instruments on the *same* adapter take turns, one
+  GPIB transfer at a time. VXI-11 `lock()`/`unlock()` work per instrument.
 * If an adapter is unplugged, accesses to that bus fail with an I/O error. The
   first access after it is plugged back in (into any socket) finds it again by
   name and reopens it, which takes about 5 s. Only ports no other bus is using are
@@ -147,9 +152,15 @@ replies end at normal speed. `no_eoi` can stay set either way.
 1. `DeviceLock` rewritten: two clients using the same instrument no longer get
    spurious "locked by another link" errors, and `WAITLOCK` really waits.
 2. `device_remote` crashed (`lock.is_open` doesn't exist).
-3. If a client drops its TCP connection without `destroy_link`, its link and lock
-   are released.
+3. If a client drops its TCP connection without `destroy_link`, its links and
+   locks are released.
 4. Write chunk limit raised from 1 kB to 16 kB.
+5. One TCP connection can carry several links. The original kept only the
+   newest, so a client with two instruments on one connection got "invalid
+   link identifier" on the first. Calls for different links on one connection
+   also run in parallel (replies matched by RPC xid), while calls for the same
+   link keep their order. A `create_link` whose lock request fails no longer
+   leaks the link.
 
 ## Client examples
 

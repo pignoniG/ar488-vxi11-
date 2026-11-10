@@ -28,6 +28,8 @@ from . import vxi11
 import logging
 import threading
 import socketserver
+import collections
+import copy
 from contextlib import contextmanager
 
 from . import instrument_device as Instrument
@@ -187,7 +189,7 @@ class Vxi11Server(socketserver.ThreadingMixIn, rpc.TCPServer):
         return link_id, self._link_registry[link_id]
         
     def link_delete(self, link_id):
-        del self._link_registry[link_id]
+        self._link_registry.pop(link_id, None)
         return
 
     #def link_name(self, link_id):
@@ -243,27 +245,117 @@ class Vxi11CoreServer(Vxi11Server):
         return
 
 
-class Vxi11CoreHandler(Vxi11Handler):
+# RPCs whose arguments start with a link id
+LINK_PROCS = frozenset((11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23))
+FINISH_WAIT_S = 30
 
-    link_id = 0
+
+class Vxi11CoreHandler(Vxi11Handler):
+    """One instance per client TCP connection (core channel).
+
+    Patched for ar488-vxi11:
+    * A connection can carry any number of links (VXI-11 allows it, and some
+      VISA libraries open all their sessions to one host over one connection).
+      The original kept only the last link per connection.
+    * Calls for different links on one connection run in parallel (one worker
+      per link, replies matched by RPC xid); calls for the same link still run
+      in the order received.
+    * If the client vanishes without destroy_link, its links and locks are
+      released, otherwise an explicit lock would be held forever.
+    """
+
     device = None
 
-    def finish(self):
-        # Patched for ar488-vxi11: release lock / link if the client vanished
-        # without calling destroy_link, otherwise an explicit lock is held forever.
+    def setup(self):
+        self.links = {}                        # link id -> device, shared by the workers
+        self._send_lock = threading.Lock()
+        self._qcond = threading.Condition()
+        self._queues = {}                      # route key -> deque of pending calls
+        self._busy = 0
+        return super().setup()
+
+    def _select(self, link_id):
+        self.device = self.links.get(link_id)
+        return self.device is not None
+
+    @staticmethod
+    def _route_key(call):
         try:
-            if self.link_id and self.link_id in self.server._link_registry:
+            u = rpc.Unpacker(call)
+            for _ in range(5):                 # xid, type, rpcvers, prog, vers
+                u.unpack_uint()
+            proc = u.unpack_uint()
+            u.unpack_auth()
+            u.unpack_auth()
+            if proc in LINK_PROCS:
+                return u.unpack_uint()
+        except Exception:
+            pass
+        return None                            # create_link, intr chan, null, garbage
+
+    def handle(self):
+        while True:
+            try:
+                call = rpc.recvrecord(self.request)
+            except (EOFError, OSError):
+                break
+            key = self._route_key(call)
+            with self._qcond:
+                q = self._queues.get(key)
+                if q is not None:
+                    q.append(call)
+                    continue
+                q = self._queues[key] = collections.deque([call])
+                self._busy += 1
+            threading.Thread(target=self._worker, args=(key, q), daemon=True).start()
+        # let calls still running end before finish() releases the links
+        with self._qcond:
+            if not self._qcond.wait_for(lambda: self._busy == 0, FINISH_WAIT_S):
+                logger.warning('client %s gone, %d call(s) still running',
+                               self.client_address, self._busy)
+
+    def _worker(self, key, q):
+        while True:
+            with self._qcond:
+                if not q:
+                    del self._queues[key]
+                    self._busy -= 1
+                    self._qcond.notify_all()
+                    return
+                call = q.popleft()
+            call_handler = copy.copy(self)     # own packer/unpacker, shared self.links
+            call_handler.addpackers()
+            try:
+                reply = call_handler.handle_call(call)
+            except Exception:
+                logger.exception('error handling call from %s', self.client_address)
+                reply = None
+            if reply is not None:
+                with self._send_lock:
+                    try:
+                        rpc.sendrecord(self.request, reply)
+                    except OSError:
+                        pass
+
+    def finish(self):
+        try:
+            for link_id, device in list(self.links.items()):
                 logger.info('client %s dropped link %s (%s) without destroy_link',
-                            self.client_address, self.link_id, self.device.device_name)
+                            self.client_address, link_id, device.device_name)
                 try:
-                    self.device.device_enable_srq(False, None)
-                    self.device.destroy_intr_chan()
+                    device.device_enable_srq(False, None)
+                    device.destroy_intr_chan()
                 except Exception:
                     pass
-                self.device.lock.release(self.link_id)
-                self.server.link_delete(self.link_id)
+                device.lock.release(link_id)
+                self.server.link_delete(link_id)
+            self.links.clear()
         finally:
             return super().finish()
+
+    def _last_device(self):
+        # create/destroy_intr_chan carry no link id: use the newest link
+        return next(reversed(self.links.values()), None)
 
     def handle_10(self):
         '''The create_link RPC creates a new link. 
@@ -275,12 +367,12 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('****************************')
         logger.debug('CREATE_LINK %s' ,params)
 
-        self.link_id = 0
+        link_id = 0
         error = vxi11.ERR_NO_ERROR
-        
+
         try:
             logger.debug('Device name "%s"', device_name)
-            self.link_id, self.device = self.server.link_create(device_name)
+            link_id, self.device = self.server.link_create(device_name)
         except KeyError:
             error = vxi11.ERR_DEVICE_NOT_ACCESSIBLE
             logger.debug("Create link failed")
@@ -288,13 +380,18 @@ class Vxi11CoreHandler(Vxi11Handler):
             self.device.device_init()
             if lock_device == True:
                 flags = 0
-                error = self.device.lock.acquire(self.link_id, flags, lock_timeout)
+                error = self.device.lock.acquire(link_id, flags, lock_timeout)
+            if error == vxi11.ERR_NO_ERROR:
+                self.links[link_id] = self.device
+            else:
+                self.server.link_delete(link_id)   # don't leak a link the client never got
+                link_id = 0
 
         abort_port = 0
         if error == vxi11.ERR_NO_ERROR:
             abort_port = self.server.abort_port
-            
-        result = (error, self.link_id, abort_port, MAX_RECEIVE_SIZE)
+
+        result = (error, link_id, abort_port, MAX_RECEIVE_SIZE)
         self.turn_around()
         self.packer.pack_create_link_resp(result)
         return
@@ -305,7 +402,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         params = self.unpacker.unpack_device_link()
         link_id = params
 
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             logger.debug('DESTROY_LINK %s to %s', link_id, self.device.device_name)
@@ -313,9 +410,10 @@ class Vxi11CoreHandler(Vxi11Handler):
             self.device.device_enable_srq(False,None)
             self.device.destroy_intr_chan()
 
-            self.device.lock.release(link_id) 
+            self.device.lock.release(link_id)
 
             # now remove link and therefore delete everything.
+            self.links.pop(link_id, None)
             self.server.link_delete(link_id)
             error = vxi11.ERR_NO_ERROR
             
@@ -330,7 +428,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('DEVICE_WRITE %s', params)
         link_id, io_timeout, lock_timeout, flags, opaque_data = params
 
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         elif len(opaque_data) > MAX_RECEIVE_SIZE:
             error = vxi11.ERR_PARAMETER_ERROR
@@ -357,7 +455,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         opaque_data = b''
         reason = 0
         
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             with self.device.lock(link_id, flags, lock_timeout) as error:
@@ -377,7 +475,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         link_id, flags, lock_timeout, io_timeout = params
 
         stb=0
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             with self.device.lock(link_id, flags, lock_timeout) as error:
@@ -396,7 +494,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('DEVICE_TRIGGER %s', params)
         link_id, flags, lock_timeout, io_timeout = params
 
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             with self.device.lock(link_id, flags, lock_timeout) as error:
@@ -414,7 +512,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('DEVICE_CLEAR %s', params)
         link_id, flags, lock_timeout, io_timeout = params
 
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             with self.device.lock(link_id, flags, lock_timeout) as error:
@@ -432,7 +530,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('DEVICE_REMOTE %s', params)
         link_id, flags, lock_timeout, io_timeout = params
 
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             with self.device.lock(link_id, flags, lock_timeout) as error:
@@ -450,7 +548,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('DEVICE_LOCAL %s', params)
         link_id, flags, lock_timeout, io_timeout = params
 
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             with self.device.lock(link_id, flags, lock_timeout) as error:
@@ -468,7 +566,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('DEVICE_LOCK %s', params)
         link_id, flags, lock_timeout = params
 
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             error = self.device.lock.acquire(link_id, flags, lock_timeout)
@@ -484,7 +582,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('DEVICE_UNLOCK %s', params)
         link_id = params
  
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             error = self.device.lock.release(link_id)
@@ -500,7 +598,11 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('DEVICE_CREATE_INTR_CHAN %s', params)
         host_addr, host_port, prog_num, prog_vers, prog_family = params
 
-        error = self.device.create_intr_chan(host_addr, host_port, prog_num, prog_vers, prog_family)
+        device = self._last_device()
+        if device is None:
+            error = vxi11.ERR_CHANNEL_NOT_ESTABLISHED
+        else:
+            error = device.create_intr_chan(host_addr, host_port, prog_num, prog_vers, prog_family)
 
         self.turn_around()
         self.packer.pack_device_error(error)
@@ -512,7 +614,8 @@ class Vxi11CoreHandler(Vxi11Handler):
         # no params (void) for this function according to vxi11-spec B.6.13 V1.0 !
         logger.debug('DEVICE_DESTROY_INTR_CHAN')
 
-        error = self.device.destroy_intr_chan()
+        device = self._last_device()
+        error = vxi11.ERR_CHANNEL_NOT_ESTABLISHED if device is None else device.destroy_intr_chan()
 
         self.turn_around()
         self.packer.pack_device_error(error)
@@ -525,7 +628,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         logger.debug('DEVICE_ENABLE_SRQ %s', params)
         link_id, enable, handle = params
 
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             error = self.device.device_enable_srq(enable,handle)
@@ -542,7 +645,7 @@ class Vxi11CoreHandler(Vxi11Handler):
         link_id, flags, io_timeout, lock_timeout, cmd, network_order, data_size, opaque_data_in = params
 
         opaque_data_out = b""
-        if link_id != self.link_id:
+        if not self._select(link_id):
             error = vxi11.ERR_INVALID_LINK_IDENTIFIER
         else:
             with self.device.lock(link_id, flags, lock_timeout) as error:
