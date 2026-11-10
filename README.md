@@ -106,6 +106,19 @@ replies end at normal speed. `no_eoi` can stay set either way.
   (pyvisa-py, python-vxi11) or puts several instruments on one connection (VISA
   libraries may do this). Instruments on the *same* adapter take turns, one
   GPIB transfer at a time. VXI-11 `lock()`/`unlock()` work per instrument.
+* **FIFO per instrument.** When several clients use the same instrument, a
+  client that writes gets the instrument's turn and keeps it until it has read
+  its whole answer (or its read times out). The others wait in the order they
+  arrived, up to their own VISA timeout. A turn also ends after `fifo_hold_s`
+  (default 1 s) without activity, for clients that send a command and read
+  nothing back, and a client that keeps writing while others wait goes to the
+  back of the queue after `fifo_hold_s`. Turns are per instrument, so other
+  instruments on the same bus are only delayed by actual bus traffic. Set
+  `fifo_hold_s = 0` under `[server]` to turn this off.
+  Tested 2026-11-10 without locks: four clients on the Keithley 2000 (60/60
+  answers correct; the gateway before this change got 0/5 right), two clients
+  each on the scope (1000-byte waveforms + `*IDN?`) and on the 3245A, all at
+  the same time.
 * If an adapter is unplugged, accesses to that bus fail with an I/O error. The
   first access after it is plugged back in (into any socket) finds it again by
   name and reopens it, which takes about 5 s. Only ports no other bus is using are
@@ -120,13 +133,17 @@ replies end at normal speed. `no_eoi` can stay set either way.
 
 ### Limitations
 
-* **Several clients on the same instrument must use VISA locks**
-  (`inst.lock_excl()` / `unlock()`), as with any real GPIB or LAN instrument.
-  Otherwise client A's query reply can be read by client B. Different
-  instruments, on the same bus or on different buses, can be used at the same time.
-  pyvisa-py never asks the server to wait for a lock, so with pyvisa-py
-  `lock_excl()` fails at once while another client holds it: retry it in a loop.
-  NI-VISA waits up to its lock timeout.
+* **Several clients on the same instrument** don't need VISA locks for
+  plain query/answer use: the FIFO (see "How it works") gives every answer to
+  the client that asked. A client that only sends commands (no read) holds the
+  instrument for `fifo_hold_s` (1 s) after each one, so while it keeps sending,
+  other clients' queries on that instrument take about 1 s each. A client that
+  writes a query and waits longer than `fifo_hold_s` before reading can still
+  have its answer taken by another client. For multi-step sequences that must
+  not be interleaved (configure, then measure), use VISA locks
+  (`inst.lock_excl()` / `unlock()`). pyvisa-py never asks the server to wait
+  for a lock, so with pyvisa-py `lock_excl()` fails at once while another
+  client holds it: retry it in a loop. NI-VISA waits up to its lock timeout.
 * Serial poll of the HP 3456A only works with AR488 0.53. Firmware 0.51.15
   never answered `++spoll` for it.
 * The adapter has no serial flow control and a 64-byte buffer. The gateway
@@ -161,6 +178,8 @@ replies end at normal speed. `no_eoi` can stay set either way.
    also run in parallel (replies matched by RPC xid), while calls for the same
    link keep their order. A `create_link` whose lock request fails no longer
    leaks the link.
+6. A `device_close()` hook is called on a device when its link is destroyed or
+   its client drops off (frees the client's FIFO turn).
 
 ## Client examples
 

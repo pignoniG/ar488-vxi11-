@@ -245,6 +245,16 @@ class Vxi11CoreServer(Vxi11Server):
         return
 
 
+def _device_close(device):
+    # optional hook (ar488-vxi11): the link is going away
+    close = getattr(device, 'device_close', None)
+    if close is not None:
+        try:
+            close()
+        except Exception:
+            logger.exception('device_close of %s failed', device.device_name)
+
+
 # RPCs whose arguments start with a link id
 LINK_PROCS = frozenset((11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23))
 FINISH_WAIT_S = 30
@@ -348,6 +358,7 @@ class Vxi11CoreHandler(Vxi11Handler):
                 except Exception:
                     pass
                 device.lock.release(link_id)
+                _device_close(device)
                 self.server.link_delete(link_id)
             self.links.clear()
         finally:
@@ -411,6 +422,7 @@ class Vxi11CoreHandler(Vxi11Handler):
             self.device.destroy_intr_chan()
 
             self.device.lock.release(link_id)
+            _device_close(self.device)
 
             # now remove link and therefore delete everything.
             self.links.pop(link_id, None)

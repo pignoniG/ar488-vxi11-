@@ -12,6 +12,9 @@
 
 [server]
 log_level = "INFO"      # DEBUG logs every command/response
+# fifo_hold_s = 1.0     # several clients on one instrument: a client keeps the
+#                       # instrument until it has read its answer, or for this
+#                       # long after a command it reads nothing back for. 0 = off
 
 [[interface]]
 name = "gpib0"          # Nano clone (CH340): Keithley 2000

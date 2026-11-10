@@ -20,6 +20,8 @@ import termios
 import sys
 import threading
 import time
+import collections
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import tomllib
 
@@ -387,14 +389,136 @@ ADAPTERS = {}       # "gpib0" -> AR488Adapter
 NAME_RE = re.compile(r"^\s*(gpib\d+)\s*,\s*(\d+)\s*(?:,\s*\d+\s*)?$", re.I)
 
 
+# ---- FIFO turns: each answer goes to the client that asked -----------------
+FIFO_HOLD_S = 1.0          # [server] fifo_hold_s; 0 turns the FIFO off
+
+
+class InstrumentTurn:
+    """Queues the links (clients) of one instrument so query/answer pairs don't mix.
+
+    A link that writes takes the instrument's turn and keeps it until it has
+    read a complete answer (or its read times out). Other links wait in the
+    order they arrived. A link that writes without reading back (a plain
+    command) loses the turn once it has been idle for FIFO_HOLD_S, and a link
+    that keeps writing while others wait goes to the back of the queue after
+    FIFO_HOLD_S. Never held while waiting for the bus, so other instruments
+    are not delayed.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.cond = threading.Condition()
+        self.owner = None
+        self.waiters = collections.deque()
+        self.in_flight = 0
+        self.granted_at = 0.0
+        self.idle_since = 0.0
+
+    def _expired(self, now):
+        return (self.owner is not None and self.in_flight == 0
+                and now - self.idle_since >= FIFO_HOLD_S)
+
+    def _release(self):
+        self.owner = None
+        self.cond.notify_all()
+
+    def begin(self, who, timeout_s, may_yield=False):
+        """Wait for this link's turn. False on timeout."""
+        deadline = time.monotonic() + timeout_s
+        with self.cond:
+            now = time.monotonic()
+            if self.owner is who:
+                if not (may_yield and self.waiters and now - self.granted_at >= FIFO_HOLD_S):
+                    self.in_flight += 1
+                    return True
+                self._release()                     # had it long enough: go to the back
+            self.waiters.append(who)
+            try:
+                while True:
+                    now = time.monotonic()
+                    if self._expired(now):
+                        log.debug("%s: turn of an idle client expired", self.name)
+                        self._release()
+                    if self.owner is None and self.waiters[0] is who:
+                        self.waiters.popleft()
+                        self.owner, self.granted_at, self.in_flight = who, now, 1
+                        if self.waiters:
+                            self.cond.notify_all()
+                        return True
+                    left = deadline - now
+                    if left <= 0:
+                        return False
+                    wait = left
+                    if self.owner is not None and self.in_flight == 0:
+                        wait = min(wait, self.idle_since + FIFO_HOLD_S - now + 0.001)
+                    self.cond.wait(max(wait, 0.001))
+            finally:
+                if who in self.waiters:              # timed out: leave the queue
+                    self.waiters.remove(who)
+                    self.cond.notify_all()
+
+    def end(self, who, done=False):
+        """An operation finished; done=True when the link's answer is complete."""
+        with self.cond:
+            if self.owner is not who:
+                return
+            self.in_flight -= 1
+            self.idle_since = time.monotonic()
+            if done and self.in_flight == 0:
+                self._release()
+            elif self.in_flight == 0:
+                self.cond.notify_all()              # waiters recompute the idle deadline
+
+    def drop(self, who):
+        with self.cond:
+            if who in self.waiters:
+                self.waiters.remove(who)
+            if self.owner is who:
+                self._release()
+
+
+TURNS = {}
+TURNS_LOCK = threading.Lock()
+
+
+def instrument_turn(name):
+    with TURNS_LOCK:
+        if name not in TURNS:
+            TURNS[name] = InstrumentTurn(name)
+        return TURNS[name]
+
+
 class GpibDevice(Vxi11.InstrumentDevice):
-    """VXI-11 link to one primary address on one AR488 bus."""
+    """VXI-11 link to one primary address on one AR488 bus.
+    One instance per link; all links to the same address share one InstrumentTurn."""
 
     def device_init(self):
         m = NAME_RE.match(self.device_name)
         self.adapter = ADAPTERS[m.group(1).lower()]
         self.addr = int(m.group(2))
         self.pending = b""
+        self.turn = instrument_turn(self.device_name)
+        self.write_ended = True     # last write carried END (message complete)
+
+    def device_close(self):
+        self.turn.drop(self)
+
+    @contextlib.contextmanager
+    def _turn(self, io_timeout, may_yield=False):
+        """Yields False if the turn didn't come within the client's timeout.
+        The body sets self._done = True when this link's exchange is complete."""
+        self._done = False
+        if FIFO_HOLD_S <= 0:
+            yield True
+            return
+        if not self.turn.begin(self, max(io_timeout, 1) / 1000, may_yield):
+            log.info("%s: timed out waiting for other clients' queries", self.device_name)
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            self.turn.end(self, self._done)
 
     def _guard(self, fn, *a):
         try:
@@ -410,21 +534,40 @@ class GpibDevice(Vxi11.InstrumentDevice):
 
     def device_write(self, opaque_data, flags, io_timeout):
         log.debug("%s <- %r", self.device_name, opaque_data[:200])
-        self.pending = b""
         end = bool(flags & V.OP_FLAG_END)
-        r = self._guard(self.adapter.write, self.addr, opaque_data, end)
+        # a link writing again while others wait yields its turn, but never
+        # in the middle of a message split over several writes
+        with self._turn(io_timeout, may_yield=self.write_ended) as ok:
+            if not ok:
+                return V.ERR_IO_TIMEOUT
+            self.pending = b""
+            r = self._guard(self.adapter.write, self.addr, opaque_data, end)
+            self.write_ended = end
+            if r is not None:
+                self._done = True
         return V.ERR_NO_ERROR if r is None else r
 
     def device_read(self, request_size, term_char, flags, io_timeout):
-        if not self.pending:
+        if self.pending:            # rest of an answer already fetched for this link
+            return self._deliver(request_size)
+        with self._turn(io_timeout) as ok:
+            if not ok:
+                return V.ERR_IO_TIMEOUT, 0, b""
             try:
                 self.pending = self.adapter.read(self.addr, max(io_timeout, 1) / 1000)
             except ReadTimeout:
+                self._done = True
                 return V.ERR_IO_TIMEOUT, 0, b""
             except AdapterError as e:
+                self._done = True
                 log.error("%s: %s", self.device_name, e)
                 return V.ERR_IO_ERROR, 0, b""
             log.debug("%s -> %r", self.device_name, self.pending[:200])
+            # the whole answer is now in this link's buffer: the instrument is free
+            self._done = True
+        return self._deliver(request_size)
+
+    def _deliver(self, request_size):
         data, self.pending = self.pending[:request_size], self.pending[request_size:]
         reason = Vxi11.ReadRespReason.REQCNT if self.pending else Vxi11.ReadRespReason.END
         return V.ERR_NO_ERROR, reason, data
@@ -438,11 +581,22 @@ class GpibDevice(Vxi11.InstrumentDevice):
 
     def device_clear(self, flags, io_timeout):
         self.pending = b""
-        r = self._guard(self.adapter.simple, self.addr, "++clr")
+        self.write_ended = True
+        with self._turn(io_timeout) as ok:
+            if not ok:
+                return V.ERR_IO_TIMEOUT
+            r = self._guard(self.adapter.simple, self.addr, "++clr")
+            self._done = True       # clear ends any exchange in progress
         return V.ERR_NO_ERROR if r is None else r
 
     def device_trigger(self, flags, io_timeout):
-        r = self._guard(self.adapter.simple, self.addr, "++trg")
+        # a trigger usually produces a reading for this link: take the turn
+        with self._turn(io_timeout) as ok:
+            if not ok:
+                return V.ERR_IO_TIMEOUT
+            r = self._guard(self.adapter.simple, self.addr, "++trg")
+            if r is not None:
+                self._done = True
         return V.ERR_NO_ERROR if r is None else r
 
     def device_local(self, flags, io_timeout):
@@ -563,6 +717,8 @@ def main():
     server_cfg, ifaces = load_config(args.config)
     if not args.verbose:
         logging.getLogger().setLevel(server_cfg.get("log_level", "INFO").upper())
+    global FIFO_HOLD_S
+    FIFO_HOLD_S = float(server_cfg.get("fifo_hold_s", FIFO_HOLD_S))
     for lib in ("vxi11_server", "vxi11_server.rpc", "vxi11_server.instrument_server",
                 "vxi11_server.instrument_device", "vxi11_server.vxi11"):
         logging.getLogger(lib).setLevel(logging.DEBUG if args.verbose else logging.WARNING)
