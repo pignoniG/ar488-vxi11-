@@ -20,6 +20,7 @@ TCPIP::<pi-ip>::inst0::INSTR         # the gateway itself (see "Gateway queries"
 | `ar488-vxi11.service` | systemd unit (runs as user `ar488gw`, group `dialout`) |
 | `install.sh` | installs to `/opt/ar488-vxi11`, enables rpcbind + the service |
 | `test_client.py` | PyVISA client for testing / scanning a bus over the network |
+| `docs/firmware.md` | AR488 firmware: the patches, build, flash, restore, adapter details |
 
 ## Install / update
 
@@ -54,8 +55,9 @@ python3 -c "import serial,time; s=serial.Serial('/dev/ttyUSB0',115200); time.sle
 then add `[[interface]] name = "gpib3"` to `/etc/ar488-vxi11.toml` and start the
 gateway again.
 
-All adapters use SN75160/SN75161 bus drivers (TE = D6, DC = D13). The firmware
-source, build script, patches and backups of the original firmware are in
+All adapters use SN75160/SN75161 bus drivers (TE = D6, DC = D13). How the
+firmware is patched, built and flashed is in [docs/firmware.md](docs/firmware.md).
+The firmware source, built `.hex` and backups of the original firmware are in
 `~/Documents/ar488-firmware` on the Pi (not in this repo).
 
 **Firmware requirements:** the gateway works with 0.51.x, and with 0.53.46 *only
