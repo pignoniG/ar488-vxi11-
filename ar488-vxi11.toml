@@ -35,3 +35,11 @@ name = "gpib2"          # Nano clone (CH340): Agilent 54624A
 #                       # end after no_eoi_tmo_ms of silence instead
 # no_eoi_tmo_ms = 200
 # auto_no_eoi = true    # detect such instruments automatically (first read ~3 s)
+
+# Web interface (monitoring, settings, console, logger). Defaults shown.
+# Settings changed on the web page are stored in /var/lib/ar488-vxi11/state.json
+# and take precedence over this file; the Settings page can reset them.
+# [web]
+# enabled = true
+# port = 8080
+# bind = "0.0.0.0"

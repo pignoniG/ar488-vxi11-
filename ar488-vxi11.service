@@ -7,8 +7,11 @@ After=rpcbind.service network-online.target
 Type=simple
 User=ar488gw
 Group=dialout
-# openocd/flashrom udev rules put FTDI serial adapters in plugdev, not dialout
-SupplementaryGroups=plugdev
+# openocd/flashrom udev rules put FTDI serial adapters in plugdev, not dialout;
+# video gives vcgencmd (Pi power/throttling status for the web page)
+SupplementaryGroups=plugdev video
+# web interface settings, aliases and logger data: /var/lib/ar488-vxi11
+StateDirectory=ar488-vxi11
 ExecStart=/usr/bin/python3 /opt/ar488-vxi11/ar488_vxi11.py -c /etc/ar488-vxi11.toml
 Restart=always
 RestartSec=3

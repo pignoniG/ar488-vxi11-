@@ -30,6 +30,8 @@ import threading
 import socketserver
 import collections
 import copy
+import socket
+import time
 from contextlib import contextmanager
 
 from . import instrument_device as Instrument
@@ -255,6 +257,12 @@ def _device_close(device):
             logger.exception('device_close of %s failed', device.device_name)
 
 
+# Open client connections, for monitoring (ar488-vxi11 web UI): id -> handler
+CONNECTIONS = {}
+CONNECTIONS_LOCK = threading.Lock()
+_conn_ids = iter(range(1, 1 << 62))
+
+
 # RPCs whose arguments start with a link id
 LINK_PROCS = frozenset((11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23))
 FINISH_WAIT_S = 30
@@ -282,7 +290,19 @@ class Vxi11CoreHandler(Vxi11Handler):
         self._qcond = threading.Condition()
         self._queues = {}                      # route key -> deque of pending calls
         self._busy = 0
+        self.connected_at = self.last_activity = time.time()
+        self.calls = 0
+        with CONNECTIONS_LOCK:
+            self.conn_id = next(_conn_ids)
+            CONNECTIONS[self.conn_id] = self
         return super().setup()
+
+    def disconnect(self):
+        """Drop this client (from the web UI); finish() then releases its links and locks."""
+        try:
+            self.request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def _select(self, link_id):
         self.device = self.links.get(link_id)
@@ -310,6 +330,8 @@ class Vxi11CoreHandler(Vxi11Handler):
             except (EOFError, OSError):
                 break
             key = self._route_key(call)
+            self.last_activity = time.time()
+            self.calls += 1
             with self._qcond:
                 q = self._queues.get(key)
                 if q is not None:
@@ -348,6 +370,8 @@ class Vxi11CoreHandler(Vxi11Handler):
                         pass
 
     def finish(self):
+        with CONNECTIONS_LOCK:
+            CONNECTIONS.pop(getattr(self, 'conn_id', None), None)
         try:
             for link_id, device in list(self.links.items()):
                 logger.info('client %s dropped link %s (%s) without destroy_link',
@@ -388,6 +412,8 @@ class Vxi11CoreHandler(Vxi11Handler):
             error = vxi11.ERR_DEVICE_NOT_ACCESSIBLE
             logger.debug("Create link failed")
         else:
+            self.device.client_address = self.client_address   # for monitoring
+            self.device.link_id = link_id
             self.device.device_init()
             if lock_device == True:
                 flags = 0

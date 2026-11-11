@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPIB gateway</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='4' width='14' height='8' rx='2' fill='%23378ADD'/%3E%3C/svg%3E">
+<style>
+:root{--bg:#f6f5f2;--card:#fff;--soft:#f1efe8;--text:#22221f;--sub:#5f5e5a;--mut:#888780;--line:rgba(0,0,0,.12);--line2:rgba(0,0,0,.22);
+--acc:#185fa5;--accbg:#e6f1fb;--ok:#3b6d11;--okbg:#eaf3de;--warn:#854f0b;--warnbg:#faeeda;--bad:#a32d2d;--badbg:#fcebeb;--r:8px;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#1b1b19;--card:#252523;--soft:#2c2c2a;--text:#ecebe6;--sub:#b4b2a9;--mut:#888780;--line:rgba(255,255,255,.12);--line2:rgba(255,255,255,.24);
+--acc:#85b7eb;--accbg:#0c447c;--ok:#c0dd97;--okbg:#27500a;--warn:#fac775;--warnbg:#633806;--bad:#f7c1c1;--badbg:#791f1f;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--acc)}
+.app{display:grid;grid-template-columns:190px minmax(0,1fr);min-height:100vh}
+nav{border-right:.5px solid var(--line);padding:16px 10px;position:sticky;top:0;height:100vh;overflow:auto}
+nav .brand{font-weight:600;padding:2px 10px 2px;font-size:15px}
+nav .host{color:var(--mut);font-size:12px;padding:0 10px 14px}
+nav a{display:flex;gap:8px;align-items:center;padding:7px 10px;border-radius:var(--r);color:var(--sub);text-decoration:none}
+nav a:hover{background:var(--soft)}
+nav a.on{background:var(--card);color:var(--text);box-shadow:0 0 0 .5px var(--line)}
+nav svg{width:16px;height:16px;flex:none}
+main{padding:20px 24px 60px;max-width:1200px;min-width:0}
+h1{font-size:20px;font-weight:600;margin:0}
+h2{font-size:15px;font-weight:600;margin:0 0 8px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.card{background:var(--card);border:.5px solid var(--line);border-radius:12px;padding:12px 14px;min-width:0}
+.grid{display:grid;gap:12px}
+.g3{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+.pill{display:inline-block;font-size:11px;padding:1px 8px;border-radius:var(--r);white-space:nowrap;background:var(--soft);color:var(--sub)}
+.ok{background:var(--okbg);color:var(--ok)}.warn{background:var(--warnbg);color:var(--warn)}.bad{background:var(--badbg);color:var(--bad)}.acc{background:var(--accbg);color:var(--acc)}
+.sub{color:var(--sub)}.mut{color:var(--mut);font-size:12px}.mono{font-family:var(--mono);font-size:12.5px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-top:.5px solid var(--line)}
+.row:first-of-type{border-top:0}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-weight:500;color:var(--sub);font-size:12px;padding:6px 8px;border-bottom:.5px solid var(--line2)}
+td{padding:6px 8px;border-bottom:.5px solid var(--line);vertical-align:top}
+.tw{overflow-x:auto}
+button,.btn{font:inherit;font-size:13px;padding:5px 12px;border-radius:var(--r);border:.5px solid var(--line2);background:var(--card);color:var(--text);cursor:pointer;white-space:nowrap}
+button:hover{background:var(--soft)}button.pri{background:var(--acc);color:var(--card);border-color:var(--acc)}
+button.danger{color:var(--bad)}button:disabled{opacity:.5;cursor:default}
+button.sm{font-size:12px;padding:2px 8px}
+input,select,textarea{font:inherit;font-size:13px;padding:5px 8px;border-radius:var(--r);border:.5px solid var(--line2);background:var(--card);color:var(--text);min-width:0}
+input[type=checkbox]{width:auto}
+label.f{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--sub)}
+.form{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;align-items:end}
+.err{color:var(--bad);font-size:13px}.note{color:var(--ok);font-size:13px}
+.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.stat{background:var(--soft);border-radius:var(--r);padding:8px 12px}
+.stat b{display:block;font-size:20px;font-weight:600}
+.log{font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;word-break:break-all}
+.consolelog{max-height:60vh;overflow:auto;background:var(--soft);border-radius:var(--r);padding:8px 10px}
+.consolelog div{padding:2px 0;border-bottom:.5px solid var(--line)}
+canvas{width:100%;height:280px;display:block}
+.hide{display:none!important}
+.tabs{display:flex;gap:4px;margin-bottom:12px}
+#toast{position:fixed;right:16px;bottom:16px;max-width:420px;z-index:9}
+#toast div{background:var(--card);border:.5px solid var(--line2);border-radius:var(--r);padding:8px 12px;margin-top:6px}
+.menu{display:none}
+@media (max-width:760px){.app{grid-template-columns:1fr}nav{position:static;height:auto;border-right:0;border-bottom:.5px solid var(--line);display:none}
+nav.open{display:block}.menu{display:inline-block}main{padding:14px 16px 60px}}
+</style>
+</head>
+<body>
+<div class="app">
+<nav id="nav">
+  <div class="brand">GPIB gateway</div>
+  <div class="host" id="hostname">…</div>
+</nav>
+<main>
+  <div class="top"><div class="bar"><button class="menu sm" onclick="document.getElementById('nav').classList.toggle('open')">Menu</button><h1 id="title">Dashboard</h1></div><div class="bar" id="topbar"></div></div>
+  <div id="page"></div>
+</main>
+</div>
+<div id="toast"></div>
+<script>
+"use strict";
+const ICON = {
+ dashboard:'M4 4h6v8H4zM14 4h6v5h-6zM14 13h6v7h-6zM4 16h6v4H4z',
+ instruments:'M5 7h14v10H5zM9 17v3M15 17v3M8 11h3M8 13h5',
+ console:'M5 7l4 4-4 4M11 16h8',
+ logger:'M4 19h16M5 15l4-5 4 3 6-7',
+ traffic:'M4 12h4l2-6 4 12 2-6h4',
+ clients:'M8 11a3 3 0 100-6 3 3 0 000 6zM3 20c0-3 2-5 5-5s5 2 5 5M16 11a3 3 0 100-6M18 15c2 .5 3 2.5 3 5',
+ settings:'M12 9a3 3 0 100 6 3 3 0 000-6zM12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1',
+ system:'M4 5h16v10H4zM9 19h6M12 15v4'};
+const PAGES = [["dashboard","Dashboard"],["instruments","Instruments"],["console","Console"],["logger","Logger"],
+ ["traffic","Traffic"],["clients","Clients"],["settings","Settings"],["system","System"]];
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const svg = p => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="${p}"/></svg>`;
+let S = null, CUR = "", TIMER = null;
+
+document.getElementById("nav").insertAdjacentHTML("beforeend",
+  PAGES.map(([k,t]) => `<a href="#${k}" id="nav-${k}">${svg(ICON[k])}${t}</a>`).join(""));
+
+async function api(path, body) {
+  const opt = body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)};
+  const r = await fetch(path, opt);
+  let d = {};
+  try { d = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error(d.error || `${r.status} ${r.statusText}`);
+  return d;
+}
+function toast(msg, bad) {
+  const el = document.createElement("div");
+  el.innerHTML = `<span class="${bad ? "err" : ""}">${esc(msg)}</span>`;
+  $("#toast").append(el); setTimeout(() => el.remove(), bad ? 7000 : 3500);
+}
+async function act(fn, okmsg) {
+  try { const r = await fn(); if (okmsg) toast(typeof okmsg === "function" ? okmsg(r) : okmsg); return r; }
+  catch (e) { toast(e.message, true); }
+}
+const ago = t => { if (!t) return "never"; const s = Math.max(0, (Date.now()/1000) - t);
+  return s < 2 ? "now" : s < 90 ? `${Math.round(s)} s ago` : s < 5400 ? `${Math.round(s/60)} min ago` : s < 172800 ? `${Math.round(s/3600)} h ago` : `${Math.round(s/86400)} d ago`; };
+const dur = s => { s = Math.round(s); const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  return d ? `${d} d ${h} h` : h ? `${h} h ${m} min` : m ? `${m} min` : `${s} s`; };
+const hms = t => new Date(t*1000).toLocaleTimeString([], {hour12:false});
+const short = s => s ? s.replace(/^\/dev\/serial\/by-(path|id)\//, "").replace(/^platform-.*-usb-0:/, "USB ").replace(/:1\.0-port0$/, "") : "";
+const ver = v => (v || "").replace(/^AR488 GPIB controller, ver\. /, "").replace(/, .*$/, "");
+const instName = i => i.aliases.length ? i.aliases[0] : (i.idn ? i.idn.split(",").slice(0,2).join(" ").slice(0,28) : `address ${i.addr}`);
+const allInst = () => S ? S.buses.flatMap(b => b.instruments.map(i => ({...i, bus:b.name}))) : [];
+const canEdit = () => S && S.auth.logged_in;
+const needLogin = () => canEdit() ? "" : `<div class="card" style="margin-bottom:12px"><span class="sub">${S && S.auth.has_password ? "Read-only. <a href='#settings'>Log in</a> to make changes." : "Read-only. <a href='#settings'>Set a password</a> to enable changes."}</span></div>`;
+
+async function refresh() {
+  try { S = await api("/api/status"); } catch (e) { $("#topbar").innerHTML = `<span class="pill bad">gateway unreachable</span>`; return; }
+  $("#hostname").textContent = `${S.host} · v${S.version}`;
+  const n = allInst().length;
+  const pl = (k, one, many) => `${k} ${k === 1 ? one : many}`;
+  $("#topbar").innerHTML = `<span class="pill ok">Running</span><span class="mut">up ${dur(S.now - S.started)} · ${pl(S.buses.length, "bus", "buses")} · ${pl(n, "instrument", "instruments")} · ${pl(S.clients.length, "client", "clients")}</span>`;
+  if (LIVE_PAGES[CUR] && PAGES_RENDER[CUR].live) PAGES_RENDER[CUR].live();
+}
+
+/* ---------------- dashboard ---------------- */
+function busCard(b) {
+  const st = b.state === "ready" ? (b.serial_errors ? "warn" : "ok") : "bad";
+  const rows = b.instruments.map(i => `<div class="row"><span><b style="font-weight:500">${i.addr}</b> ${esc(instName(i))}</span>
+     <span class="bar" style="gap:4px">${i.no_eoi ? '<span class="pill warn">no EOI</span>' : ""}${i.locked_by ? `<span class="pill acc">locked ${esc(i.locked_by)}</span>` : ""}${i.waiting ? `<span class="pill acc">queue ${i.waiting}</span>` : ""}${i.listening === false ? '<span class="pill">not seen</span>' : ""}
+     <span class="mut">${i.rate ? i.rate + " op/s" : (i.last ? ago(i.last) : "idle")}</span></span></div>`).join("") || `<div class="mut" style="padding:6px 0">No instruments known yet. Use Scan buses.</div>`;
+  return `<div class="card"><div class="bar" style="justify-content:space-between"><h2 style="margin:0">${esc(b.name)}</h2><span class="pill ${st}">${esc(b.state)}${b.busy ? " · busy" : ""}</span></div>
+   <div class="mut" style="margin:2px 0 8px">${esc(short(b.port)) || "no port"} · ${esc(ver(b.version))} · ${b.baud || "?"} baud${b.eot_esc ? " · escaped EOT" : ""}</div>${rows}
+   ${b.last_error ? `<div class="mut" style="margin-top:6px">last error: ${esc(b.last_error)}</div>` : ""}</div>`;
+}
+function healthRows(h) {
+  const uv = h.undervoltage_now ? '<span class="pill bad">undervoltage now</span>' : h.uv_last_hour ? `<span class="pill warn">${h.uv_last_hour}× in the last hour</span>` : '<span class="pill ok">OK</span>';
+  return `<div class="row"><span>Power</span>${uv}</div>
+   <div class="row"><span>Temperature</span><span class="sub">${h.temp == null ? "?" : h.temp.toFixed(1) + " °C"}${h.throttled_now ? ' <span class="pill bad">throttled</span>' : ""}</span></div>
+   <div class="row"><span>Gateway CPU</span><span class="sub">${h.cpu} % · ${h.rss_mb ?? "?"} MB</span></div>
+   <div class="row"><span>USB reconnects</span><span class="sub">${S.buses.reduce((a,b) => a + Math.max(0, b.opens - 1), 0)}</span></div>`;
+}
+const eventRows = ev => ev.slice().reverse().map(e => `<div class="row" style="justify-content:flex-start"><span class="mut" style="flex:none">${hms(e.t)}</span><span class="${e.level === "ERROR" ? "err" : e.level === "WARNING" ? "" : "sub"}" style="flex:1;min-width:0;word-break:break-word">${esc(e.msg)}</span></div>`).join("") || '<div class="mut">Nothing yet</div>';
+function clientRows(cl) {
+  return cl.map(c => `<div class="row"><span>${esc(c.ip)}</span><span class="mut" style="flex:1;text-align:center">${esc(c.links.map(l => l.device + (l.locked ? " (locked)" : "")).join(", ") || "no instrument")}</span><span class="mut">${ago(c.last_activity)}</span></div>`).join("") || '<div class="mut">No clients connected</div>';
+}
+const PAGES_RENDER = {};
+PAGES_RENDER.dashboard = {
+  render() { $("#page").innerHTML = `<div class="bar" style="justify-content:flex-end;margin:-6px 0 12px"><button onclick="scan()">Scan buses</button></div>
+    <div class="grid g3" id="buses"></div><div class="grid g2" style="margin-top:12px"><div class="card"><h2>Clients</h2><div id="dcl"></div></div><div class="card"><h2>Pi health</h2><div id="dh"></div></div></div>
+    <div class="card" style="margin-top:12px"><h2>Recent events</h2><div id="dev"></div></div>`; this.live(); },
+  live() { if (!S) return; $("#buses").innerHTML = S.buses.map(busCard).join(""); $("#dcl").innerHTML = clientRows(S.clients);
+    $("#dh").innerHTML = healthRows(S.health); $("#dev").innerHTML = eventRows(S.events); }
+};
+async function scan() {
+  const r = await act(() => api("/api/scan", {}), r => "Scan done: " + Object.entries(r.scan).map(([b,s]) => `${b}=${s.error ? "error" : s.addrs.join(",") || "nothing"}`).join("; "));
+  refresh();
+}
+
+/* ---------------- instruments ---------------- */
+PAGES_RENDER.instruments = {
+  render() {
+    $("#page").innerHTML = needLogin() + `<div class="bar" style="justify-content:space-between;margin-bottom:12px"><span class="sub">Aliases work in VISA strings: <span class="mono">TCPIP::${esc(S ? S.host : "gpibpi")}::<i>alias</i>::INSTR</span></span><button onclick="scan()">Scan buses</button></div>
+     <div class="card tw"><table><thead><tr><th>Resource</th><th>Alias</th><th>Identity</th><th>Activity</th><th></th></tr></thead><tbody id="itab"></tbody></table></div>
+     <div class="card hide" id="iedit" style="margin-top:12px"></div><div class="card" id="isnip" style="margin-top:12px"><h2>Connecting</h2><div class="sub">Pick an instrument to see its VISA resource and a PyVISA example.</div></div>`;
+    this.live();
+  },
+  live() {
+    if (!S || document.activeElement && document.activeElement.closest && document.activeElement.closest("#iedit")) return;
+    $("#itab").innerHTML = S.buses.map(b => b.instruments.map(i => `<tr>
+      <td><span class="mono">${esc(i.key)}</span>${i.listening === false ? ' <span class="pill">not seen</span>' : ""}${i.no_eoi ? ' <span class="pill warn">no EOI</span>' : ""}</td>
+      <td>${i.aliases.map(a => `<span class="pill acc">${esc(a)}</span>`).join(" ") || '<span class="mut">none</span>'}</td>
+      <td>${esc(i.idn) || '<span class="mut">unknown</span>'}${i.note ? `<div class="mut">${esc(i.note)}</div>` : ""}</td>
+      <td class="mut">${i.ops} ops${i.errors ? `, <span class="err">${i.errors} errors</span>` : ""}<br>${i.last ? ago(i.last) + " · " + esc(i.last_client) : "never used"}</td>
+      <td style="text-align:right"><div class="bar" style="justify-content:flex-end;gap:4px"><button class="sm" onclick="showSnip('${i.key}')">Connect</button><button class="sm" onclick="editInst('${i.key}')">Edit</button><button class="sm" onclick="location.hash='console/${i.key}'">Console</button></div></td></tr>`).join("")).join("")
+      || `<tr><td colspan="5" class="mut">No instruments known yet. Use Scan buses.</td></tr>`;
+  }
+};
+function showSnip(key) {
+  const i = allInst().find(x => x.key === key); const name = i && i.aliases[0] || key;
+  const res = `TCPIP::${S.host}::${name}::INSTR`;
+  $("#isnip").innerHTML = `<h2>Connecting to ${esc(name)}</h2><div class="bar"><span class="mono">${esc(res)}</span><button class="sm" onclick="navigator.clipboard.writeText('${esc(res)}');toast('Copied')">Copy</button></div>
+   <pre class="log consolelog" style="margin-top:8px">import pyvisa
+rm = pyvisa.ResourceManager()        # or ResourceManager("@py") for pyvisa-py
+inst = rm.open_resource("${esc(res)}")
+inst.timeout = 5000                  # ms
+print(inst.query("${esc(i && i.idn.startsWith("HP3245") ? "ID?" : "*IDN?")}"))</pre>
+   <div class="mut">Also works as <span class="mono">TCPIP::${esc(S.host)}::${esc(key)}::INSTR</span> or with the IP address instead of the host name.</div>`;
+}
+function editInst(key) {
+  const i = allInst().find(x => x.key === key); if (!i) return;
+  const el = $("#iedit"); el.classList.remove("hide");
+  el.innerHTML = `<h2>${esc(key)}</h2><div class="form">
+    <label class="f">Aliases (comma separated)<input id="e-al" value="${esc(i.aliases.join(", "))}" placeholder="k2000"></label>
+    <label class="f">Note<input id="e-note" value="${esc(i.note)}" placeholder="bench DMM, rear inputs"></label>
+    <label class="f">Identify with<select id="e-cmd"><option>*IDN?</option><option>ID?</option></select></label></div>
+    <div class="bar" style="margin-top:10px"><button class="pri" onclick="saveInst('${key}')">Save</button><button onclick="identify('${key}')">Identify now</button><button onclick="forgetInst('${key}')">Forget</button><button onclick="$('#iedit').classList.add('hide')">Close</button><span class="mut">Identify sends the command to the instrument: older HP instruments may not understand *IDN?.</span></div><div id="e-msg"></div>`;
+  el.scrollIntoView({behavior:"smooth", block:"nearest"});
+}
+async function saveInst(key) {
+  await act(() => api("/api/instrument", {resource:key, aliases:$("#e-al").value, note:$("#e-note").value}), "Saved");
+  $("#iedit").classList.add("hide"); refresh();
+}
+async function forgetInst(key) {
+  await act(() => api("/api/instrument", {resource:key, aliases:"", note:"", forget:true}), "Forgotten (it reappears if it's on the bus or used)");
+  $("#iedit").classList.add("hide"); refresh();
+}
+async function identify(key) {
+  await act(() => api("/api/identify", {resource:key, cmd:$("#e-cmd").value}), r => `Identity: ${r.idn || "(empty reply)"}`);
+  refresh();
+}
+
+/* ---------------- console ---------------- */
+let HIST = [], HPOS = 0, HEX = false;
+PAGES_RENDER.console = {
+  render(arg) {
+    const opts = [`<option value="inst0">inst0 (the gateway)</option>`].concat(allInst().map(i => `<option value="${esc(i.key)}">${esc(i.key)}${i.aliases.length ? " · " + esc(i.aliases[0]) : ""}${i.idn ? " · " + esc(i.idn.slice(0,30)) : ""}</option>`));
+    $("#page").innerHTML = needLogin() + `<div class="card"><div class="form" style="grid-template-columns:minmax(200px,1fr) 120px auto">
+      <label class="f">Instrument<select id="c-res">${opts.join("")}</select></label>
+      <label class="f">Timeout (ms)<input id="c-tmo" type="number" value="3000" min="100" max="120000" step="100"></label>
+      <label class="f" style="flex-direction:row;align-items:center;gap:6px;padding-bottom:6px"><input type="checkbox" id="c-nl" checked>append \\n</label></div>
+      <div class="bar" style="margin-top:10px"><input id="c-cmd" class="mono" style="flex:1;min-width:200px" placeholder="*IDN?" autocomplete="off"><button class="pri" onclick="cio('query')">Query</button><button onclick="cio('write')">Write</button><button onclick="cio('read')">Read</button></div>
+      <div class="bar" style="margin-top:8px"><button class="sm" onclick="cio('stb')">Serial poll</button><button class="sm" onclick="cio('clear')">Device clear</button><button class="sm" onclick="cio('trigger')">Trigger</button><button class="sm" onclick="cio('local')">Go to local</button>
+      <span style="flex:1"></span><label class="mut"><input type="checkbox" id="c-hex" ${HEX ? "checked" : ""} onchange="HEX=this.checked;drawCon()"> hex</label><button class="sm" onclick="CONLOG=[];drawCon()">Clear</button></div>
+      <div class="mut" style="margin-top:6px">Escapes: \\n \\r \\t \\xHH. Goes through the same queue and locks as every other client.</div></div>
+      <div class="card" style="margin-top:12px"><div class="consolelog log" id="c-log"></div></div>`;
+    if (arg) $("#c-res").value = arg;
+    $("#c-cmd").addEventListener("keydown", e => {
+      if (e.key === "Enter") cio(e.shiftKey ? "write" : "query");
+      else if (e.key === "ArrowUp" && HIST.length) { HPOS = Math.max(0, HPOS - 1); $("#c-cmd").value = HIST[HPOS]; e.preventDefault(); }
+      else if (e.key === "ArrowDown" && HIST.length) { HPOS = Math.min(HIST.length, HPOS + 1); $("#c-cmd").value = HIST[HPOS] || ""; e.preventDefault(); }
+    });
+    $("#c-cmd").focus(); drawCon();
+  }
+};
+let CONLOG = [];
+function drawCon() {
+  const el = $("#c-log"); if (!el) return;
+  el.innerHTML = CONLOG.map(l => `<div><span class="mut">${l.t} ${esc(l.res)}</span> ${l.out !== null ? `<span style="color:var(--acc)">&gt; ${esc(l.out)}</span>` : ""}${l.op !== "query" && l.op !== "write" ? `<span class="sub">[${esc(l.op)}]</span>` : ""}
+   ${l.err ? `<span class="err">${esc(l.err)}</span>` : l.reply !== null ? `<br>${HEX ? esc(l.hex) : esc(l.reply.replace(/[\x00-\x09\x0b-\x1f\x7f-\xff]/g, c => "\\x" + c.charCodeAt(0).toString(16).padStart(2, "0")))}` : l.stb !== null ? ` status byte ${l.stb} (0x${l.stb.toString(16)}, bits ${[...Array(8).keys()].filter(b => l.stb >> b & 1).join(",") || "none"})` : " ok"}
+   <span class="mut">${l.ms ? l.ms + " ms" : ""}</span></div>`).join("") || '<span class="mut">Replies appear here. Enter = query, Shift+Enter = write, ↑ = history.</span>';
+  el.scrollTop = el.scrollHeight;
+}
+async function cio(op) {
+  const res = $("#c-res").value, cmd = $("#c-cmd").value;
+  if ((op === "query" || op === "write") && !cmd) { toast("Enter a command first", true); return; }
+  const entry = {t:new Date().toLocaleTimeString([], {hour12:false}), res, op, out:(op === "query" || op === "write") ? cmd : null, reply:null, stb:null, err:null};
+  if (entry.out !== null) { if (HIST[HIST.length-1] !== cmd) HIST.push(cmd); HPOS = HIST.length; }
+  try {
+    const r = await api("/api/io", {resource:res, op, data:cmd, newline:$("#c-nl").checked, timeout_ms:+$("#c-tmo").value});
+    Object.assign(entry, {reply:r.reply, hex:r.reply_hex, stb:r.stb, ms:r.ms});
+  } catch (e) { entry.err = e.message; }
+  CONLOG.push(entry); if (CONLOG.length > 500) CONLOG.shift(); drawCon();
+  if (op === "query" || op === "write") $("#c-cmd").select();
+}
+
+/* ---------------- logger ---------------- */
+let LJOBS = [], LSEL = null, LPTS = [], LSINCE = 0, LWIN = 3600;
+PAGES_RENDER.logger = {
+  async render() {
+    $("#page").innerHTML = needLogin() + `<div class="card tw"><div class="bar" style="justify-content:space-between;margin-bottom:6px"><h2 style="margin:0">Logging jobs</h2><button onclick="editJob()">New job</button></div>
+      <table><thead><tr><th>Name</th><th>Instrument</th><th>Query</th><th>Every</th><th>Status</th><th>Points</th><th></th></tr></thead><tbody id="ltab"></tbody></table></div>
+      <div class="card hide" id="ledit" style="margin-top:12px"></div>
+      <div class="card" style="margin-top:12px"><div class="bar" style="justify-content:space-between"><h2 style="margin:0" id="lname">Chart</h2>
+      <div class="bar"><select id="lwin" onchange="LWIN=+this.value;drawChart()"><option value="600">10 min</option><option value="3600" selected>1 hour</option><option value="21600">6 hours</option><option value="86400">1 day</option><option value="0">all</option></select></div></div>
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(110px,1fr));margin:10px 0" id="lstats"></div><canvas id="chart"></canvas><div class="mut" id="lfoot"></div></div>`;
+    $("#lwin").value = String(LWIN);
+    await this.live(true);
+  },
+  async live(first) {
+    try { LJOBS = (await api("/api/logger")).jobs; } catch (e) { return; }
+    if (document.activeElement && document.activeElement.closest && document.activeElement.closest("#ledit")) return;
+    $("#ltab").innerHTML = LJOBS.map(j => `<tr style="${j.id === LSEL ? "background:var(--soft)" : ""}"><td><a href="javascript:selJob('${j.id}')">${esc(j.name)}</a></td><td class="mono">${esc(j.resource)}</td><td class="mono">${esc(j.query)}</td><td>${j.interval_s} s</td>
+      <td>${j.running ? '<span class="pill ok">running</span>' : '<span class="pill">stopped</span>'}${j.errors ? ` <span class="pill warn" title="${esc(j.last_error)}">${j.errors} errors</span>` : ""}<div class="mut">${esc(j.last_reply || j.last_error)}</div></td>
+      <td>${j.count}<div class="mut">${(j.csv_bytes/1024).toFixed(0)} kB CSV</div></td>
+      <td><div class="bar" style="gap:4px;justify-content:flex-end">${j.running ? `<button class="sm" onclick="jobAct('${j.id}','stop')">Stop</button>` : `<button class="sm" onclick="jobAct('${j.id}','start')">Start</button>`}
+      <a class="btn sm" style="font-size:12px;padding:2px 8px;text-decoration:none" href="/api/logger/${j.id}/csv">CSV</a><button class="sm" onclick="editJob('${j.id}')">Edit</button></div></td></tr>`).join("")
+      || '<tr><td colspan="7" class="mut">No jobs yet. A job sends a query at a fixed interval and records the first number in each reply.</td></tr>';
+    if (first && !LSEL && LJOBS.length) LSEL = LJOBS[0].id, LPTS = [], LSINCE = 0;
+    if (LSEL) {
+      try { const d = await api(`/api/logger/${LSEL}/data?since=${LSINCE}`); if (d.points.length) { LPTS = LPTS.concat(d.points).slice(-20000); LSINCE = LPTS[LPTS.length-1][0]; } } catch (e) {}
+      drawChart();
+    }
+  }
+};
+function selJob(id) { LSEL = id; LPTS = []; LSINCE = 0; PAGES_RENDER.logger.live(); }
+async function jobAct(id, a) { await act(() => api(`/api/logger/${id}/${a}`, {}), a === "start" ? "Started" : a === "stop" ? "Stopped" : "Done"); PAGES_RENDER.logger.live(); }
+function editJob(id) {
+  const j = LJOBS.find(x => x.id === id) || {name:"", resource:(allInst()[0] || {}).key || "", setup:"", query:"", interval_s:1, timeout_s:5};
+  const el = $("#ledit"); el.classList.remove("hide");
+  const opts = allInst().map(i => `<option value="${esc(i.aliases[0] || i.key)}">${esc(i.key)}${i.aliases.length ? " · " + esc(i.aliases[0]) : ""}</option>`).join("");
+  el.innerHTML = `<h2>${id ? "Edit job" : "New job"}</h2><div class="form">
+   <label class="f">Name<input id="j-name" value="${esc(j.name)}" placeholder="K2000 DC volts"></label>
+   <label class="f">Instrument<input id="j-res" list="j-list" value="${esc(j.resource)}"><datalist id="j-list">${opts}</datalist></label>
+   <label class="f">Setup, sent once at start<input id="j-setup" class="mono" value="${esc(j.setup)}" placeholder=":SENS:FUNC 'VOLT:DC'"></label>
+   <label class="f">Query, every interval<input id="j-query" class="mono" value="${esc(j.query)}" placeholder=":FETCH?"></label>
+   <label class="f">Interval (s)<input id="j-int" type="number" min="0.2" step="0.1" value="${j.interval_s}"></label>
+   <label class="f">Timeout (s)<input id="j-tmo" type="number" min="0.1" step="0.1" value="${j.timeout_s}"></label></div>
+   <div class="mut" style="margin-top:6px">Each reply's first number is logged; the full reply goes into the CSV. Keithley 2000: query <span class="mono">:FETCH?</span> (<span class="mono">READ?</span> gives error -213 while it measures continuously). HP 3456A: setup <span class="mono">H F1 R1 T4</span>, query <span class="mono">T3</span>.</div>
+   <div class="bar" style="margin-top:10px"><button class="pri" onclick="saveJob('${id || ""}', true)">Save and start</button><button onclick="saveJob('${id || ""}', false)">Save</button>
+   ${id ? `<button onclick="if(confirm('Delete the recorded data of this job?'))jobAct('${id}','clear')">Clear data</button><button class="danger" onclick="if(confirm('Delete this job and its data?')){jobAct('${id}','delete');$('#ledit').classList.add('hide')}">Delete</button>` : ""}
+   <button onclick="$('#ledit').classList.add('hide')">Close</button></div>`;
+  el.scrollIntoView({behavior:"smooth", block:"nearest"});
+}
+async function saveJob(id, start) {
+  const r = await act(() => api("/api/logger/save", {id, name:$("#j-name").value, resource:$("#j-res").value, setup:$("#j-setup").value,
+    query:$("#j-query").value, interval_s:+$("#j-int").value, timeout_s:+$("#j-tmo").value, enabled:start}), "Saved");
+  if (r) { $("#ledit").classList.add("hide"); LSEL = r.id; LPTS = []; LSINCE = 0; PAGES_RENDER.logger.live(); }
+}
+function fmt(v) { if (v == null || !isFinite(v)) return "–"; const a = Math.abs(v);
+  return a !== 0 && (a < 1e-3 || a >= 1e6) ? v.toExponential(4) : (+v.toPrecision(7)).toString(); }
+function drawChart() {
+  const c = $("#chart"); if (!c) return;
+  const j = LJOBS.find(x => x.id === LSEL);
+  $("#lname").textContent = j ? j.name : "Chart";
+  const now = Date.now()/1000, from = LWIN ? now - LWIN : 0;
+  const pts = LPTS.filter(p => p[0] >= from && p[1] != null);
+  const vals = pts.map(p => p[1]);
+  const n = vals.length, mean = n ? vals.reduce((a,b) => a+b, 0)/n : null;
+  const sd = n > 1 ? Math.sqrt(vals.reduce((a,b) => a + (b-mean)**2, 0)/(n-1)) : null;
+  const mn = n ? Math.min(...vals) : null, mx = n ? Math.max(...vals) : null;
+  $("#lstats").innerHTML = [["Last", n ? vals[n-1] : null], ["Mean", mean], ["Std dev", sd], ["Min", mn], ["Max", mx], ["Points", n]]
+    .map(([k,v]) => `<div class="stat"><span class="mut">${k}</span><b class="mono" style="font-size:16px">${k === "Points" ? v : fmt(v)}</b></div>`).join("");
+  $("#lfoot").textContent = j ? `${j.resource} · ${j.query} every ${j.interval_s} s${j.running ? "" : " · stopped"}` : "Pick a job";
+  const dpr = window.devicePixelRatio || 1, W = c.clientWidth, H = c.clientHeight;
+  c.width = W * dpr; c.height = H * dpr;
+  const g = c.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const cs = getComputedStyle(document.documentElement), line = cs.getPropertyValue("--line"), sub = cs.getPropertyValue("--mut"), acc = cs.getPropertyValue("--acc");
+  g.font = "11px system-ui"; g.fillStyle = sub; g.strokeStyle = line; g.lineWidth = 1;
+  if (n < 1) { g.fillText("No data in this time window", 10, 20); return; }
+  const L = 74, R = 10, T = 8, B = 22;
+  const t1 = Math.max(LWIN ? now : pts[n-1][0], pts[0][0] + 1), t0 = Math.min(LWIN ? Math.max(from, pts[0][0]) : pts[0][0], t1 - 1);
+  let lo = mn, hi = mx; if (hi - lo < Math.abs(hi) * 1e-9 + 1e-15) { lo -= Math.abs(lo) * 1e-6 + 1e-9; hi += Math.abs(hi) * 1e-6 + 1e-9; }
+  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  const X = t => L + (t - t0) / (t1 - t0) * (W - L - R), Y = v => T + (hi - v) / (hi - lo) * (H - T - B);
+  g.textAlign = "right";
+  for (let k = 0; k <= 4; k++) { const v = lo + (hi - lo) * k / 4, y = Y(v); g.beginPath(); g.moveTo(L, y + .5); g.lineTo(W - R, y + .5); g.stroke(); g.fillText(fmt(v), L - 6, y + 4); }
+  g.textAlign = "center";
+  for (let k = 0; k <= 4; k++) { const t = t0 + (t1 - t0) * k / 4; g.fillText(new Date(t*1000).toLocaleTimeString([], {hour12:false, hour:"2-digit", minute:"2-digit", second: (t1-t0) < 1200 ? "2-digit" : undefined}), Math.min(Math.max(X(t), L + 20), W - 30), H - 6); }
+  g.strokeStyle = acc; g.lineWidth = 1.5; g.beginPath();
+  const step = Math.max(1, Math.floor(n / (W * 2)));
+  for (let k = 0; k < n; k += step) { const x = X(pts[k][0]), y = Y(pts[k][1]); k ? g.lineTo(x, y) : g.moveTo(x, y); }
+  g.stroke();
+  if (n < 200) { g.fillStyle = acc; for (const p of pts) { g.beginPath(); g.arc(X(p[0]), Y(p[1]), 2, 0, 7); g.fill(); } }
+}
+window.addEventListener("resize", () => CUR === "logger" && drawChart());
+
+/* ---------------- traffic ---------------- */
+let TROWS = [], TSEQ = 0, TPAUSE = false;
+PAGES_RENDER.traffic = {
+  render() {
+    $("#page").innerHTML = `<div class="card" style="margin-bottom:12px"><div class="bar"><label class="f">Instrument<select id="t-dev" onchange="drawTrace()"><option value="">all</option>${allInst().map(i => `<option>${esc(i.key)}</option>`).join("")}</select></label>
+      <label class="f">Client<input id="t-cl" placeholder="192.168.1.42" oninput="drawTrace()"></label><label class="f">Only<select id="t-op" onchange="drawTrace()"><option value="">everything</option><option value="err">errors</option></select></label>
+      <span style="flex:1"></span><button id="t-pause" onclick="TPAUSE=!TPAUSE;this.textContent=TPAUSE?'Resume':'Pause'">${TPAUSE ? "Resume" : "Pause"}</button><button onclick="TROWS=[];drawTrace()">Clear view</button></div>
+      <div class="mut" style="margin-top:6px">Every operation on every instrument, newest first. Data is cut at 160 bytes. Kept in memory only (last 2000).</div></div>
+      <div class="card tw"><table style="table-layout:fixed;min-width:760px"><colgroup><col style="width:112px"><col style="width:96px"><col style="width:150px"><col style="width:64px"><col><col style="width:64px"></colgroup>
+      <thead><tr><th>Time</th><th>Instrument</th><th>Client</th><th>Op</th><th>Data</th><th>ms</th></tr></thead><tbody id="ttab"></tbody></table></div>`;
+    this.live();
+  },
+  async live() {
+    if (TPAUSE) return;
+    try { const d = await api(`/api/trace?since=${TSEQ}`); if (d.rows.length) { TROWS = TROWS.concat(d.rows).slice(-2000); TSEQ = TROWS[TROWS.length-1].seq; } } catch (e) { return; }
+    drawTrace();
+  }
+};
+const show = (s, n) => esc(s.replace(/[\x00-\x09\x0b-\x1f\x7f-\xff]/g, c => "\\x" + c.charCodeAt(0).toString(16).padStart(2, "0"))) + (n > 160 ? `<span class="mut"> … ${n} bytes</span>` : "");
+function drawTrace() {
+  const el = $("#ttab"); if (!el) return;
+  const dev = $("#t-dev").value, cl = $("#t-cl").value.trim(), only = $("#t-op").value;
+  const rows = TROWS.filter(r => (!dev || r.dev === dev) && (!cl || r.client.includes(cl)) && (!only || r.err)).slice(-400).reverse();
+  el.innerHTML = rows.map(r => `<tr><td class="mono">${hms(r.t)}.${String(Math.floor(r.t % 1 * 1000)).padStart(3, "0")}</td><td class="mono">${esc(r.dev)}</td><td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.client)}</td><td>${esc(r.op)}</td>
+    <td class="mono" style="word-break:break-all">${r.sent_len ? `<span style="color:var(--acc)">&gt; ${show(r.sent, r.sent_len)}</span>` : ""}${r.got_len ? `${r.sent_len ? "<br>" : ""}&lt; ${show(r.got, r.got_len)}` : ""}${r.err ? ` <span class="err">${esc(r.err)}</span>` : ""}</td><td class="mono">${r.ms}</td></tr>`).join("")
+    || '<tr><td colspan="6" class="mut">No traffic yet</td></tr>';
+}
+
+/* ---------------- clients ---------------- */
+PAGES_RENDER.clients = {
+  render() { $("#page").innerHTML = needLogin() + `<div class="card tw"><table><thead><tr><th>Client</th><th>Instruments</th><th>Connected</th><th>Last activity</th><th>Calls</th><th></th></tr></thead><tbody id="cltab"></tbody></table></div>
+    <div class="mut" style="margin-top:8px">Disconnecting a client releases its locks and its place in the instrument queues. Its program sees a connection error.</div>`; this.live(); },
+  live() { if (!S) return; $("#cltab").innerHTML = S.clients.map(c => `<tr><td>${esc(c.ip)}${c.port ? `<span class="mut">:${c.port}</span>` : ""}</td>
+    <td>${c.links.map(l => `<span class="mono">${esc(l.device)}</span>${l.locked ? ' <span class="pill acc">locked</span>' : ""}`).join("<br>") || '<span class="mut">none</span>'}</td>
+    <td>${ago(c.connected_at)}</td><td>${ago(c.last_activity)}</td><td>${c.calls}</td><td style="text-align:right">${c.internal ? '<span class="mut">built-in</span>' : `<button class="sm danger" onclick="discon(${c.id},'${esc(c.ip)}')">Disconnect</button>`}</td></tr>`).join("")
+    || '<tr><td colspan="6" class="mut">No clients connected</td></tr>'; }
+};
+async function discon(id, ip) { if (!confirm(`Disconnect ${ip}?`)) return; await act(() => api("/api/client/disconnect", {id}), "Disconnected"); refresh(); }
+
+/* ---------------- settings ---------------- */
+PAGES_RENDER.settings = {
+  async render() {
+    let cfg; try { cfg = await api("/api/config"); } catch (e) { $("#page").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+    const A = S.auth, dis = canEdit() ? "" : "disabled";
+    const authCard = !A.has_password ? `<div class="card"><h2>Set a password</h2><div class="sub" style="margin-bottom:8px">Anyone on the network can view this page. Changing anything, including the console and logger, needs this password.</div>
+        <div class="bar"><input type="password" id="pw1" placeholder="new password" autocomplete="new-password"><input type="password" id="pw2" placeholder="repeat" autocomplete="new-password"><button class="pri" onclick="setPw()">Set password</button></div><div id="pwmsg"></div></div>`
+      : !A.logged_in ? `<div class="card"><h2>Log in</h2><div class="bar"><input type="password" id="pw" placeholder="password" autocomplete="current-password" onkeydown="if(event.key==='Enter')login()"><button class="pri" onclick="login()">Log in</button></div></div>`
+      : `<div class="card"><h2>Logged in</h2><div class="bar"><button onclick="logout()">Log out</button><input type="password" id="pw1" placeholder="new password" autocomplete="new-password"><input type="password" id="pw2" placeholder="repeat" autocomplete="new-password"><button onclick="setPw(true)">Change password</button></div></div>`;
+    const sv = cfg.server;
+    $("#page").innerHTML = authCard + `<div class="card" style="margin-top:12px"><h2>Gateway</h2><div class="form">
+      <label class="f">FIFO hold time (s)<input id="s-fifo" type="number" min="0" max="60" step="0.1" value="${sv.fifo_hold_s}" ${dis}></label>
+      <label class="f">Log level<select id="s-log" ${dis}>${["DEBUG","INFO","WARNING","ERROR"].map(l => `<option ${l === sv.log_level ? "selected" : ""}>${l}</option>`).join("")}</select></label></div>
+      <div class="mut" style="margin-top:6px">FIFO hold: how long a client keeps an instrument after a command it reads nothing back for. 0 turns the queue off. ${sv.overridden.length ? "Changed here: " + sv.overridden.join(", ") : ""}</div>
+      <div class="bar" style="margin-top:10px"><button class="pri" onclick="saveServer()" ${dis}>Save</button>${sv.overridden.length ? `<button onclick="resetOv('server')" ${dis}>Use config file values</button>` : ""}</div></div>
+      ${cfg.interfaces.map(i => `<div class="card" style="margin-top:12px"><div class="bar" style="justify-content:space-between"><h2 style="margin:0">${esc(i.name)}</h2>
+        <div class="bar"><button class="sm" onclick="adapter('${i.name}','reopen')" ${dis}>Reopen</button><button class="sm" onclick="adapter('${i.name}','ifc')" ${dis}>Pulse IFC</button><button class="sm" onclick="adapter('${i.name}','store_name')" ${dis}>Store name in adapter</button></div></div>
+        <div class="form" style="margin-top:8px">
+        <label class="f">Port (empty = find by stored name)<input id="i-${i.name}-port" value="${esc(i.port)}" placeholder="/dev/serial/by-id/…" ${dis}></label>
+        <label class="f">Serial speed<select id="i-${i.name}-baud" ${dis}><option value="0" ${!i.baud ? "selected" : ""}>automatic</option><option value="500000" ${i.baud == 500000 ? "selected" : ""}>500000</option><option value="115200" ${i.baud == 115200 ? "selected" : ""}>115200</option></select></label>
+        <label class="f">Addresses without EOI<input id="i-${i.name}-noeoi" value="${i.no_eoi.join(", ")}" placeholder="9, 22" ${dis}></label>
+        <label class="f">No-EOI end timeout (ms)<input id="i-${i.name}-tmo" type="number" min="20" max="3000" value="${i.no_eoi_tmo_ms}" ${dis}></label>
+        <label class="f" style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" id="i-${i.name}-auto" ${i.auto_no_eoi ? "checked" : ""} ${dis}>detect no-EOI instruments</label>
+        <label class="f" style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" id="i-${i.name}-ifc" ${i.ifc_on_open ? "checked" : ""} ${dis}>pulse IFC when opening</label></div>
+        ${i.overridden.length ? `<div class="mut" style="margin-top:6px">Changed here: ${i.overridden.join(", ")}</div>` : ""}
+        <div class="bar" style="margin-top:10px"><button class="pri" onclick="saveIface('${i.name}')" ${dis}>Save</button>${i.overridden.length ? `<button onclick="resetOv('${i.name}')" ${dis}>Use config file values</button>` : ""}</div></div>`).join("")}
+      <div class="card" style="margin-top:12px"><h2>Backup</h2><div class="sub" style="margin-bottom:8px">Aliases, instrument notes, settings changed here and logger jobs. The password isn't included.</div>
+      <div class="bar"><a class="btn" style="text-decoration:none" href="/api/export">Download settings</a><label class="btn">Restore from file<input type="file" accept=".json" class="hide" onchange="importCfg(this)" ${dis}></label></div>
+      <div class="mut" style="margin-top:8px">Base config: <span class="mono">${esc(cfg.config_file)}</span> · changes made here: <span class="mono">${esc(cfg.state_file)}</span></div></div>`;
+  }
+};
+async function setPw(change) {
+  const a = $("#pw1").value, b = $("#pw2").value;
+  if (a.length < 6) { toast("Use at least 6 characters", true); return; }
+  if (a !== b) { toast("The passwords don't match", true); return; }
+  if (await act(() => api("/api/password", {new:a, change:!!change}), "Password set")) { await refresh(); route(); }
+}
+async function login() { if (await act(() => api("/api/login", {password:$("#pw").value}), "Logged in")) { await refresh(); route(); } }
+async function logout() { await act(() => api("/api/logout", {}), "Logged out"); await refresh(); route(); }
+async function saveServer() {
+  const r = await act(() => api("/api/settings", {server:{fifo_hold_s:+$("#s-fifo").value, log_level:$("#s-log").value}}), "Saved");
+  if (r) { (r.notes || []).forEach(n => toast(n)); route(); }
+}
+async function saveIface(n) {
+  const v = id => $(`#i-${n}-${id}`);
+  const noeoi = v("noeoi").value.split(/[,\s]+/).filter(x => x).map(Number);
+  if (noeoi.some(x => !Number.isInteger(x) || x < 0 || x > 30)) { toast("Addresses without EOI: whole numbers 0 to 30", true); return; }
+  const r = await act(() => api("/api/settings", {interface:{[n]:{port:v("port").value, baud:+v("baud").value, no_eoi:noeoi,
+    no_eoi_tmo_ms:+v("tmo").value, auto_no_eoi:v("auto").checked, ifc_on_open:v("ifc").checked}}}), "Saved");
+  if (r) { (r.notes || []).forEach(x => toast(x)); route(); }
+}
+async function resetOv(section) { const r = await act(() => api("/api/settings/reset", {section})); if (r) { r.notes.forEach(x => toast(x)); route(); } }
+async function adapter(bus, action) {
+  if (action === "store_name" && !confirm(`Write the name "${bus}" into the adapter's EEPROM?`)) return;
+  toast(action === "reopen" ? `Reopening ${bus}… (takes a few seconds)` : "Working…");
+  await act(() => api("/api/adapter", {bus, action}), r => r.message); refresh();
+}
+async function importCfg(inp) {
+  const f = inp.files[0]; if (!f) return;
+  let d; try { d = JSON.parse(await f.text()); } catch (e) { toast("Not a JSON file", true); return; }
+  if (!confirm("Replace aliases, notes, changed settings and logger jobs with the file's?")) return;
+  const r = await act(() => api("/api/import", d)); if (r) r.notes.forEach(x => toast(x));
+}
+
+/* ---------------- system ---------------- */
+PAGES_RENDER.system = {
+  async render() {
+    $("#page").innerHTML = `<div class="grid g2"><div class="card"><h2>Raspberry Pi</h2><div id="sy-h"></div></div><div class="card"><h2>Gateway</h2><div id="sy-g"></div>
+      <div class="bar" style="margin-top:10px"><button class="danger" onclick="restart()" ${canEdit() ? "" : "disabled"}>Restart gateway</button></div></div></div>
+      <div class="card" style="margin-top:12px"><div class="bar" style="justify-content:space-between"><h2 style="margin:0">Events</h2><select id="sy-lv" onchange="PAGES_RENDER.system.events()"><option value="">all</option><option value="WARNING">warnings and errors</option><option value="ERROR">errors</option></select></div><div id="sy-ev" style="margin-top:8px"></div></div>`;
+    this.live(); this.events();
+  },
+  live() {
+    if (!S || !$("#sy-h")) return; const h = S.health;
+    $("#sy-h").innerHTML = `<div class="row"><span>Undervoltage</span><span>${h.undervoltage_now ? '<span class="pill bad">now</span>' : '<span class="pill ok">not now</span>'}${h.undervoltage_since_boot ? ' <span class="pill warn">has happened since boot</span>' : ""}</span></div>
+      <div class="row"><span>Undervoltage events</span><span class="sub">${h.uv_last_hour} last hour · ${h.uv_last_day} last day${h.uv_sensor ? "" : " (no sensor)"}</span></div>
+      <div class="row"><span>Throttling</span><span>${h.throttled_now ? '<span class="pill bad">now</span>' : '<span class="pill ok">no</span>'}${h.throttled_since_boot ? ' <span class="pill warn">since boot</span>' : ""} <span class="mut">${esc(h.throttled_raw || "")}</span></span></div>
+      <div class="row"><span>Temperature</span><span class="sub">${h.temp == null ? "?" : h.temp.toFixed(1) + " °C"}</span></div>
+      <div class="row"><span>Load</span><span class="sub">${h.load.join(" · ")}</span></div>
+      ${h.undervoltage_since_boot || h.uv_last_day ? '<div class="mut" style="margin-top:8px">Undervoltage can make USB adapters drop out. Use a 5 V / 3 A supply, or power the adapters from a powered hub.</div>' : ""}`;
+    $("#sy-g").innerHTML = `<div class="row"><span>Version</span><span class="sub">${esc(S.version)}</span></div><div class="row"><span>Running for</span><span class="sub">${dur(S.now - S.started)}</span></div>
+      <div class="row"><span>CPU · memory</span><span class="sub">${h.cpu} % · ${h.rss_mb ?? "?"} MB</span></div>
+      ${S.buses.map(b => `<div class="row"><span>${esc(b.name)}</span><span class="sub">${esc(ver(b.version)) || "not connected"} · opened ${b.opens}× · ${b.serial_errors} serial errors</span></div>`).join("")}`;
+  },
+  async events() {
+    let ev; try { ev = (await api("/api/events")).events; } catch (e) { return; }
+    const lv = $("#sy-lv") ? $("#sy-lv").value : "";
+    const keep = e => !lv || (lv === "ERROR" ? e.level === "ERROR" : e.level === "WARNING" || e.level === "ERROR");
+    $("#sy-ev").innerHTML = eventRows(ev.filter(keep).slice(-300));
+  }
+};
+async function restart() {
+  if (!confirm("Restart the gateway? Connected clients lose their connection.")) return;
+  await act(() => api("/api/restart", {}), "Restarting… the page reconnects by itself");
+}
+
+/* ---------------- router ---------------- */
+async function route() {
+  const [page, ...rest] = (location.hash.slice(1) || "dashboard").split("/");
+  const p = PAGES_RENDER[page] ? page : "dashboard";
+  CUR = p;
+  document.querySelectorAll("nav a").forEach(a => a.classList.toggle("on", a.id === "nav-" + p));
+  $("#title").textContent = PAGES.find(x => x[0] === p)[1];
+  $("#nav").classList.remove("open");
+  if (!S) await refresh();
+  await PAGES_RENDER[p].render(rest.join("/"));
+}
+window.addEventListener("hashchange", route);
+const LIVE_PAGES = {dashboard:1, instruments:1, clients:1, system:1};
+setInterval(async () => {
+  if (document.hidden) return;
+  await refresh();
+  if (CUR === "traffic") PAGES_RENDER.traffic.live();
+  if (CUR === "logger") PAGES_RENDER.logger.live();
+}, 1500);
+refresh().then(route);
+</script>
+</body>
+</html>

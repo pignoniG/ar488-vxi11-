@@ -15,6 +15,7 @@ TCPIP::<pi-ip>::inst0::INSTR         # the gateway itself (see "Gateway queries"
 | file | what |
 |---|---|
 | `ar488_vxi11.py` | the gateway (AR488 serial driver + VXI-11 device handlers) |
+| `webui.py`, `web/index.html` | web interface on port 8080 (monitoring, settings, console, logger) |
 | `vxi11_server/` | vendored [python-vxi11-server](https://github.com/coburnw/python-vxi11-server) @52ecfba, patched (see below) |
 | `ar488-vxi11.toml` | config → `/etc/ar488-vxi11.toml` (buses and per-bus options) |
 | `ar488-vxi11.service` | systemd unit (runs as user `ar488gw`, group `dialout`) |
@@ -74,6 +75,44 @@ present:
   20 ms wait at the end of each reply.
 * **256-byte input buffer** (`++rxbuf`): fewer round trips on long writes.
 
+## Web interface
+
+`http://gpibpi.local:8080/` (or the Pi's IP). It runs inside the gateway, so it
+sees live queues, locks and clients. It uses no external files, so it works on
+a LAN without internet, and it also works on a phone.
+
+| page | what |
+|---|---|
+| Dashboard | one card per bus (adapter, port, firmware, speed, instruments with activity, queue, locks), clients, Pi health, recent events |
+| Instruments | every instrument seen on a bus or used, with identity, notes and **aliases**. *Scan buses* finds them (`++fndl`). *Identify* sends `*IDN?` or `ID?` (only on request, because older HP instruments don't understand `*IDN?`). *Connect* shows the VISA string and a PyVISA example. |
+| Console | send commands and queries by hand, plus serial poll, device clear, trigger and local. It uses the same queue and locks as every client. Escapes `\n \r \t \xHH`; ↑ recalls history. |
+| Logger | jobs that send a query at a fixed interval (optional setup command once at start), log the first number of each reply, and chart it with last, mean, std dev, min and max. CSV download. Jobs run in the gateway, so no PC needs to stay connected, and they survive restarts. |
+| Traffic | live trace of every operation on every instrument: client, data (first 160 bytes), duration, errors. Kept in memory, last 2000. |
+| Clients | connected VXI-11 clients, their instruments and locks. *Disconnect* frees a lock held by a crashed program. |
+| Settings | password; FIFO hold time and log level; per bus: pinned port, serial speed, no-EOI addresses and timeout, IFC on open; adapter actions (reopen, pulse IFC, store bus name in the adapter's EEPROM); settings backup and restore |
+| System | Pi undervoltage and throttling (now, since boot, events per hour/day), temperature, gateway CPU and memory, per-bus reconnects and serial errors, event log, restart |
+
+**Aliases** work in VISA resource strings: after naming `gpib0,16` `k2000`,
+programs can open `TCPIP::gpibpi::k2000::INSTR`. The alias keeps working if the
+instrument moves to another bus or address; just update it on the page.
+
+**Access:** viewing is open to the LAN. Anything that changes something
+(settings, console, logger, adapter actions, disconnecting clients) needs the
+password. You set it on the Settings page on the first visit; until then
+nothing can be changed. Sessions last 12 hours.
+
+**Storage:** settings changed on the page, aliases, notes, logger jobs and the
+password hash are kept in `/var/lib/ar488-vxi11/state.json` (owner-only), and
+logger data in `/var/lib/ar488-vxi11/logs/<job>.csv`. They take precedence over
+`/etc/ar488-vxi11.toml`, which stays the base config; *Use config file values*
+removes a change. Port and speed changes need a *Reopen*. Everything else
+applies at once. To disable the page or move it, see `[web]` in the toml. To
+reset a forgotten password, stop the service and delete `web.pw` from
+`state.json`.
+
+**Logging the Keithley 2000:** use `:FETCH?`, not `READ?`. See the instruments
+table below.
+
 ## Gateway queries (`inst0`)
 
 | query | answer |
@@ -88,7 +127,7 @@ four in parallel as well):
 
 | resource | instrument | notes |
 |---|---|---|
-| `gpib0,16` | Keithley 2000 | SCPI. ~100 ms per `READ?` at 1 PLC. 12 s averaged readings work. |
+| `gpib0,16` | Keithley 2000 | SCPI. 12 s averaged readings work. Read the latest value with `:FETCH?` (14 ms). `READ?` starts a new measurement: while the meter measures continuously (`:INIT:CONT ON`, its front-panel default) each `READ?` logs error -213 "Init ignored", and many of them overflow the error queue (-350). Send `:INIT:CONT OFF` first to use `READ?`. |
 | `gpib1,9` | HP 3245A | `ID?`, `ERR?`. Sends no EOI by default, see below. |
 | `gpib1,22` | HP 3456A | No queries: send e.g. `H F1 R1 T4`, then `T3` and read. ASCII and packed (`P1`) binary readings and serial poll work. |
 | `gpib2,8` | Agilent 54624A | SCPI. 1000-byte binary waveform (`:WAV:DATA?`) in about 1 s. |
@@ -203,6 +242,9 @@ replies end at normal speed. `no_eoi` can stay set either way.
    leaks the link.
 6. A `device_close()` hook is called on a device when its link is destroyed or
    its client drops off (frees the client's FIFO turn).
+7. For the web interface: a registry of open client connections (address,
+   links, activity) with a `disconnect()`, and each link's device knows its
+   client address.
 
 ## Client examples
 
@@ -211,7 +253,7 @@ import pyvisa
 rm = pyvisa.ResourceManager()          # NI/Keysight VISA, or ResourceManager("@py")
 dmm = rm.open_resource("TCPIP::192.168.1.187::gpib0,16::INSTR")
 print(dmm.query("*IDN?"))
-print(dmm.query("READ?"))
+print(dmm.query(":FETCH?"))
 ```
 
 ```

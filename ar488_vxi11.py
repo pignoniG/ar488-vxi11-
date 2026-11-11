@@ -195,6 +195,10 @@ class AR488Adapter:
         self._eoi = None
         self._tmo = None
         self.eot_esc = False      # firmware escapes EOT/DLE in replies (gpibpi build)
+        self.opens = 0            # successful opens (more than 1 = reconnected)
+        self.serial_errors = 0
+        self.last_error = ""
+        self.opened_at = 0.0
         self._busy_until = 0.0    # a ++read abandoned on client timeout may still run until then
         self.rxbuf = 64           # firmware serial receive buffer
 
@@ -263,6 +267,8 @@ class AR488Adapter:
         except BaseException:
             self.close()
             raise
+        self.opens += 1
+        self.opened_at = time.time()
         log.info("%s: ready, %s, %d baud%s", self.name, self.version, self.ser.baudrate,
                  f", escaped EOT, {self.rxbuf}-byte input buffer" if self.eot_esc else "")
 
@@ -323,6 +329,8 @@ class AR488Adapter:
                 return fn(*args)
             except SERIAL_ERRORS as e:
                 log.error("%s: serial error: %s", self.name, e)
+                self.serial_errors += 1
+                self.last_error = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {e}"
                 self.close()
                 raise AdapterError(str(e))
 
@@ -490,6 +498,54 @@ class AR488Adapter:
 
 ADAPTERS = {}       # "gpib0" -> AR488Adapter
 NAME_RE = re.compile(r"^\s*(gpib\d+)\s*,\s*(\d+)\s*(?:,\s*\d+\s*)?$", re.I)
+ALIASES = {}        # alias (lower case) -> "gpibN,addr"; managed by the web UI
+STARTED_AT = time.time()
+
+
+# ---- monitoring: per-instrument statistics, traffic trace, recent log -------
+TRACE = collections.deque(maxlen=2000)     # newest last
+TRACE_LOCK = threading.Lock()
+_trace_seq = 0
+STATS = {}                                 # "gpib0,16" -> dict
+TRACE_DATA_MAX = 160                       # bytes of data kept per trace entry
+EVENTS = collections.deque(maxlen=500)     # recent log records (time, level, message)
+
+
+def note(name, client, op, sent=b"", got=b"", err=None, t0=None):
+    """Record one instrument operation for the web UI (statistics + trace)."""
+    global _trace_seq
+    now = time.time()
+    dur = time.monotonic() - t0 if t0 else 0.0
+    with TRACE_LOCK:
+        st = STATS.setdefault(name, {"ops": 0, "errors": 0, "bytes_out": 0, "bytes_in": 0,
+                                     "last": 0.0, "last_client": "", "last_error": "",
+                                     "recent": collections.deque(maxlen=64)})
+        st["ops"] += 1
+        st["bytes_out"] += len(sent)
+        st["bytes_in"] += len(got)
+        st["last"] = now
+        st["last_client"] = client
+        st["recent"].append(now)
+        if err:
+            st["errors"] += 1
+            st["last_error"] = f"{time.strftime('%H:%M:%S')} {op}: {err}"
+        _trace_seq += 1
+        TRACE.append({"seq": _trace_seq, "t": now, "dev": name, "client": client, "op": op,
+                      "sent": sent[:TRACE_DATA_MAX].decode("latin-1"), "sent_len": len(sent),
+                      "got": got[:TRACE_DATA_MAX].decode("latin-1"), "got_len": len(got),
+                      "err": err or "", "ms": round(dur * 1000, 1)})
+
+
+class EventLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            EVENTS.append({"t": record.created, "level": record.levelname, "msg": record.getMessage()})
+        except Exception:
+            pass
+
+
+VXI_ERRORS = {V.ERR_IO_TIMEOUT: "timeout", V.ERR_IO_ERROR: "I/O error",
+              V.ERR_DEVICE_LOCKED_BY_ANOTHER_LINK: "locked"}
 
 
 # ---- FIFO turns: each answer goes to the client that asked -----------------
@@ -606,6 +662,19 @@ class GpibDevice(Vxi11.InstrumentDevice):
     def device_close(self):
         self.turn.drop(self)
 
+    @property
+    def client(self):
+        """Who uses this link, for monitoring: client IP, or a label (web console, logger)."""
+        label = getattr(self, "client_label", None)
+        if label:
+            return label
+        addr = getattr(self, "client_address", None)
+        return addr[0] if addr else "?"
+
+    def _note(self, op, t0, sent=b"", got=b"", r=None):
+        note(self.device_name, self.client, op, sent, got,
+             VXI_ERRORS.get(r, f"error {r}") if r not in (None, V.ERR_NO_ERROR) else None, t0)
+
     @contextlib.contextmanager
     def _turn(self, io_timeout, may_yield=False):
         """Yields False if the turn didn't come within the client's timeout.
@@ -637,6 +706,12 @@ class GpibDevice(Vxi11.InstrumentDevice):
 
     def device_write(self, opaque_data, flags, io_timeout):
         log.debug("%s <- %r", self.device_name, opaque_data[:200])
+        t0 = time.monotonic()
+        r = self._device_write(opaque_data, flags, io_timeout)
+        self._note("write", t0, sent=opaque_data, r=r)
+        return r
+
+    def _device_write(self, opaque_data, flags, io_timeout):
         end = bool(flags & V.OP_FLAG_END)
         # a link writing again while others wait yields its turn, but never
         # in the middle of a message split over several writes
@@ -653,6 +728,14 @@ class GpibDevice(Vxi11.InstrumentDevice):
     def device_read(self, request_size, term_char, flags, io_timeout):
         if self.pending:            # rest of an answer already fetched for this link
             return self._deliver(request_size)
+        t0 = time.monotonic()
+        r = self._device_read(request_size, io_timeout)
+        self._note("read", t0, got=self.pending if r[0] == V.ERR_NO_ERROR else b"", r=r[0])
+        if r[0] != V.ERR_NO_ERROR:
+            return r
+        return self._deliver(request_size)
+
+    def _device_read(self, request_size, io_timeout):
         with self._turn(io_timeout) as ok:
             if not ok:
                 return V.ERR_IO_TIMEOUT, 0, b""
@@ -668,7 +751,7 @@ class GpibDevice(Vxi11.InstrumentDevice):
             log.debug("%s -> %r", self.device_name, self.pending[:200])
             # the whole answer is now in this link's buffer: the instrument is free
             self._done = True
-        return self._deliver(request_size)
+        return V.ERR_NO_ERROR, 0, b""
 
     def _deliver(self, request_size):
         data, self.pending = self.pending[:request_size], self.pending[request_size:]
@@ -676,10 +759,14 @@ class GpibDevice(Vxi11.InstrumentDevice):
         return V.ERR_NO_ERROR, reason, data
 
     def device_readstb(self, flags, io_timeout):
+        t0 = time.monotonic()
         try:
-            return V.ERR_NO_ERROR, self.adapter.spoll(self.addr)
+            stb = self.adapter.spoll(self.addr)
+            self._note("stb", t0, got=str(stb).encode())
+            return V.ERR_NO_ERROR, stb
         except AdapterError as e:
             log.error("%s: %s", self.device_name, e)
+            self._note("stb", t0, r=V.ERR_IO_ERROR)
             return V.ERR_IO_ERROR, 0
 
     def device_clear(self, flags, io_timeout):
@@ -688,8 +775,10 @@ class GpibDevice(Vxi11.InstrumentDevice):
         with self._turn(io_timeout) as ok:
             if not ok:
                 return V.ERR_IO_TIMEOUT
+            t0 = time.monotonic()
             r = self._guard(self.adapter.simple, self.addr, "++clr")
             self._done = True       # clear ends any exchange in progress
+            self._note("clear", t0, r=r)
         return V.ERR_NO_ERROR if r is None else r
 
     def device_trigger(self, flags, io_timeout):
@@ -697,13 +786,17 @@ class GpibDevice(Vxi11.InstrumentDevice):
         with self._turn(io_timeout) as ok:
             if not ok:
                 return V.ERR_IO_TIMEOUT
+            t0 = time.monotonic()
             r = self._guard(self.adapter.simple, self.addr, "++trg")
             if r is not None:
                 self._done = True
+            self._note("trigger", t0, r=r)
         return V.ERR_NO_ERROR if r is None else r
 
     def device_local(self, flags, io_timeout):
+        t0 = time.monotonic()
         r = self._guard(self.adapter.simple, self.addr, "++loc")
+        self._note("local", t0, r=r)
         return V.ERR_NO_ERROR if r is None else r
 
     def device_remote(self, flags, io_timeout):
@@ -768,8 +861,27 @@ class GatewayRegistry(IS.DeviceRegistry):
     def directory(self):
         return [f"{n},<addr>" for n in sorted(ADAPTERS)]
 
+    def resolve(self, name):
+        """'gpibN,addr' (canonical) for an instrument name or alias; KeyError if unknown."""
+        key = name.strip().lower()
+        if key == "inst0":
+            return key
+        key = ALIASES.get(key, key)
+        m = NAME_RE.match(key)
+        if not m or m.group(1) not in ADAPTERS or not 0 <= int(m.group(2)) <= 30:
+            raise KeyError(name)
+        return f"{m.group(1)},{int(m.group(2))}"
+
+    def lock_of(self, key):
+        """The shared DeviceLock of an instrument (created if needed)."""
+        with self._lock:
+            if key not in self._registry:
+                self.register(key, GpibDevice)
+            return self._registry[key].lock
+
     def factory(self, name):
         key = name.strip().lower()
+        key = ALIASES.get(key, key)
         if key != "inst0":
             m = NAME_RE.match(key)
             if not m or m.group(1) not in ADAPTERS or not 0 <= int(m.group(2)) <= 30:
@@ -809,6 +921,15 @@ def load_config(path):
     return cfg.get("server", {}), ifaces
 
 
+def load_web_section(path):
+    """The [web] table of the config file (port, bind, enabled, state_dir)."""
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f).get("web", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-c", "--config", default="/etc/ar488-vxi11.toml")
@@ -817,7 +938,15 @@ def main():
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")
+    ev = EventLogHandler(logging.INFO)
+    logging.getLogger("ar488-vxi11").addHandler(ev)
+    logging.getLogger("webui").addHandler(ev)
     server_cfg, ifaces = load_config(args.config)
+    web_cfg = load_web_section(args.config)
+    import webui
+    state = webui.State(web_cfg.get("state_dir"))
+    server_cfg, ifaces = state.apply_overrides(server_cfg, ifaces)
+    ALIASES.update(state.aliases())
     if not args.verbose:
         logging.getLogger().setLevel(server_cfg.get("log_level", "INFO").upper())
     global FIFO_HOLD_S
@@ -845,6 +974,12 @@ def main():
     server = Vxi11.InstrumentServer(GatewayInfoDevice)
     server.listen()
     log.info("VXI-11 gateway up: %s", ", ".join(f"{n} -> {a.current_port or 'NOT FOUND'}" for n, a in sorted(ADAPTERS.items())))
+    if web_cfg.get("enabled", True):
+        try:
+            webui.start(sys.modules[__name__], state, args.config, server_cfg,
+                        web_cfg.get("bind", "0.0.0.0"), int(web_cfg.get("port", 8080)))
+        except Exception:
+            log.exception("web interface failed to start (VXI-11 keeps running)")
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())

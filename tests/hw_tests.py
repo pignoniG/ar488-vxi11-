@@ -135,7 +135,7 @@ def t_fifo():
     """Four clients query the Keithley at once without locks: every answer is theirs."""
     need("k2000")
     queries = [("*IDN?", r"KEITHLEY"), (":SENS:FUNC?", r'^"[A-Z:]+"$'),
-               ("READ?", r"^[+-]\d\.\d+E[+-]\d+$"), ("*OPC?", r"^1$")]
+               (":FETCH?", r"^[+-]\d\.\d+E[+-]\d+$"), ("*OPC?", r"^1$")]
     bad = []
 
     def client(cmd, pat):
@@ -147,7 +147,11 @@ def t_fifo():
         d.close()
     threads(*[lambda c=c, p=p: client(c, p) for c, p in queries])
     check(not bad, f"answers to the wrong client: {bad[:3]}")
-    return "60/60 answers to the right client"
+    k = dev("k2000")
+    err = k.ask(":SYST:ERR?").strip()
+    k.close()
+    check(err.startswith(("0", "+0")), f"Keithley reports {err}")
+    return "60/60 answers to the right client, no instrument errors"
 
 
 def t_fifo_mixed():
