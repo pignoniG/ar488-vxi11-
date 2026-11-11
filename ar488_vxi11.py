@@ -38,6 +38,9 @@ VERSION = "1.0"
 EOT = 0x04                     # byte AR488 appends when it sees EOI (++eot_char)
 ESCAPE_BYTES = {0x0A, 0x0D, 0x1B, 0x2B}   # LF CR ESC '+' must be escaped in data
 WRITE_CHUNK = 48               # raw bytes per serial line (escaped worst case 96 + LF)
+LINE_MAX = 110                 # escaped bytes per line with gpibpi firmware (line buffer 128; 2 lines fit its 256-byte input buffer)
+DLE = 0x10                     # gpibpi firmware with ++eot_escape 1: DLE x = data byte x
+BAUDS = (500000, 115200)       # tried in this order when no baud is configured
 SYNC_TIMEOUT_S = 10            # max time for the adapter to push one chunk onto the bus
 AR488_MAX_TMO_MS = 3000        # firmware limit for ++read_tmo_ms
 EOT_SETTLE_S = 0.02            # quiet time after EOT before we trust it is the end
@@ -77,15 +80,43 @@ def _line_query(ser, line, timeout=1.0):
     return buf.decode("ascii", "replace").strip()
 
 
-def probe_port(path, baud=115200, reset_delay=2.5):
-    """(version, stored name) of the AR488 on path, or None if it isn't one."""
+def open_ar488(path, bauds=BAUDS, reset_delay=2.5, timeout=0.2):
+    """Open path and find the baud rate its AR488 answers at.
+    Returns (serial, version), or (None, None) if nothing answers like an AR488.
+    Only the first open resets the Arduino; changing the baud rate afterwards doesn't."""
+    ser = serial.Serial(path, bauds[0], timeout=timeout, write_timeout=5)
     try:
-        with serial.Serial(path, baud, timeout=0.2, write_timeout=2) as s:
-            time.sleep(reset_delay)
-            ver = _line_query(s, "++ver", 2.0)
-            if "AR488" not in ver:
-                return None
-            return ver, _line_query(s, "++id name")
+        time.sleep(reset_delay)               # Arduino resets on open (DTR)
+        for b in bauds:
+            if ser.baudrate != b:
+                ser.baudrate = b
+            # Bytes from a wrong-baud attempt can leave the adapter's line buffer
+            # mid-line (or after an escape character), so the first command after a
+            # switch may be lost: end the line with empty lines and ask twice.
+            for attempt in range(2):
+                ser.write(b"\n\n")
+                time.sleep(0.1)
+                ser.reset_input_buffer()
+                ver = _line_query(ser, "++ver", 0.7)
+                if "AR488" in ver:
+                    time.sleep(0.05)
+                    ser.reset_input_buffer()
+                    return ser, ver.splitlines()[-1].strip()
+        ser.close()
+        return None, None
+    except BaseException:
+        ser.close()
+        raise
+
+
+def probe_port(path, reset_delay=2.5):
+    """(version, stored name, baud) of the AR488 on path, or None if it isn't one."""
+    try:
+        ser, ver = open_ar488(path, BAUDS, reset_delay)
+        if ser is None:
+            return None
+        with ser:
+            return ver, _line_query(ser, "++id name"), ser.baudrate
     except SERIAL_ERRORS:
         return None
 
@@ -113,25 +144,25 @@ def discover(force=False):
     threads = [threading.Thread(target=worker, args=(p,)) for p in ports]
     [t.start() for t in threads]
     [t.join() for t in threads]
-    _discovered = {name.lower(): p for p, (_, name) in results.items() if name}
+    _discovered = {name.lower(): (p, baud) for p, (_, name, baud) in results.items() if name}
     _discovered_at = time.monotonic()
-    for p, (ver, name) in sorted(results.items()):
-        log.info("found AR488 %r on %s (%s)", name or "<no name>", p, ver)
+    for p, (ver, name, baud) in sorted(results.items()):
+        log.info("found AR488 %r on %s at %d baud (%s)", name or "<no name>", p, baud, ver)
     return results
 
 
 def locate(name):
-    """Port of the adapter whose stored name is `name`."""
+    """(port, baud) of the adapter whose stored name is `name`."""
     with DISCOVERY_LOCK:
         fresh = time.monotonic() - _discovered_at < DISCOVERY_MAX_AGE_S
-        p = _discovered.get(name) if fresh else None
-        if p and p in free_ports():
-            return p
+        hit = _discovered.get(name) if fresh else None
+        if hit and hit[0] in free_ports():
+            return hit
         discover()
-        p = _discovered.get(name)
-        if not p:
+        hit = _discovered.get(name)
+        if not hit:
             raise AdapterError(f"{name}: no adapter with stored name {name!r} found")
-        return p
+        return hit
 
 
 class ReadTimeout(Exception):
@@ -141,7 +172,7 @@ class ReadTimeout(Exception):
 class AR488Adapter:
     """One AR488 adapter = one GPIB bus. All access is serialised by self.lock."""
 
-    def __init__(self, name, port, baud=115200, reset_delay=2.5, ifc_on_open=True,
+    def __init__(self, name, port, baud=None, reset_delay=2.5, ifc_on_open=True,
                  no_eoi=(), auto_no_eoi=True, no_eoi_tmo_ms=NO_EOI_TMO_MS):
         self.name = name
         self.port = port
@@ -163,13 +194,18 @@ class AR488Adapter:
         self._addr = None
         self._eoi = None
         self._tmo = None
+        self.eot_esc = False      # firmware escapes EOT/DLE in replies (gpibpi build)
+        self._busy_until = 0.0    # a ++read abandoned on client timeout may still run until then
+        self.rxbuf = 64           # firmware serial receive buffer
 
     # ---- low level -------------------------------------------------------
     def open(self):
         """Open the adapter. With no fixed port, find it by the name stored in
         it (++id name). Either way, refuse an adapter that reports another name."""
         self.close()
-        port = self.port or locate(self.name)
+        port, found_baud = (self.port, None) if self.port else locate(self.name)
+        bauds = (self.baud,) if self.baud else \
+            ((found_baud,) + tuple(b for b in BAUDS if b != found_baud) if found_baud else BAUDS)
         real = os.path.realpath(port)
         with PORT_LOCK:
             if real in PORTS_IN_USE:
@@ -178,14 +214,13 @@ class AR488Adapter:
         self._real = real
         try:
             log.info("%s: opening %s", self.name, port)
-            ser = serial.Serial(port, self.baud, timeout=0.5, write_timeout=5)
+            ser, ver = open_ar488(port, bauds, self.reset_delay, timeout=0.5)
+            if ser is None:
+                raise AdapterError(f"{self.name}: no AR488 answers on {port} "
+                                   f"at {', '.join(map(str, bauds))} baud")
             self.ser = ser
-            time.sleep(self.reset_delay)          # Arduino resets on open (DTR)
-            ser.reset_input_buffer()
             self._addr = self._eoi = self._tmo = None
-            self.version = self._query("++ver", 2.0)
-            if "AR488" not in self.version:
-                log.warning("%s: unexpected ++ver reply %r", self.name, self.version)
+            self.version = ver
             stored = self._query("++id name")
             if stored and stored.lower() != self.name:
                 raise AdapterError(f"{self.name}: the adapter on {port} is named {stored!r}, "
@@ -202,21 +237,34 @@ class AR488Adapter:
         # One command at a time, each confirmed: the AR488 has no flow control
         # and a 64-byte input buffer, so a burst can be partly dropped.
         try:
+            # gpibpi firmware extras: escaped EOT in replies and a bigger input buffer.
+            # Other firmware doesn't know these commands and answers with an error or nothing.
+            esc = self._query("++eot_escape", 0.5) in ("0", "1")
+            rx = self._query("++rxbuf", 0.5) if esc else ""
+            self.rxbuf = int(rx) if rx.isdigit() and int(rx) >= 64 else 64
             setup = ["++mode 1", "++auto 0", "++eos 3", "++eot_enable 1", f"++eot_char {EOT}", "++eoi 1"]
+            want = ["1", "0", "3", "1", str(EOT), "1"]
+            checks = ["++mode", "++auto", "++eos", "++eot_enable", "++eot_char", "++eoi"]
+            if esc:
+                setup.append("++eot_escape 1")
+                want.append("1")
+                checks.append("++eot_escape")
             if self.ifc_on_open:
                 setup.append("++ifc")
             for c in setup:
                 self._cmd(c)
                 if not self._query("++addr", 2.0).isdigit():
                     raise AdapterError(f"{self.name}: no answer during setup ({c})")
-            got = [self._query(q) for q in ("++mode", "++auto", "++eos", "++eot_enable", "++eot_char", "++eoi")]
-            if got != ["1", "0", "3", "1", str(EOT), "1"]:
+            got = [self._query(q) for q in checks]
+            if got != want:
                 raise AdapterError(f"{self.name}: setup not applied, adapter reports {got}")
+            self.eot_esc = esc
             self._eoi = True
         except BaseException:
             self.close()
             raise
-        log.info("%s: ready, %s", self.name, self.version)
+        log.info("%s: ready, %s, %d baud%s", self.name, self.version, self.ser.baudrate,
+                 f", escaped EOT, {self.rxbuf}-byte input buffer" if self.eot_esc else "")
 
     def close(self):
         if self.ser is not None:
@@ -266,6 +314,12 @@ class AR488Adapter:
         with self.lock:
             self._ensure_open()
             try:
+                if time.monotonic() < self._busy_until:
+                    # The firmware can't be interrupted inside ++read: anything sent
+                    # now would only be handled after its timeout. Wait for that.
+                    self._sync()
+                    self.ser.reset_input_buffer()
+                self._busy_until = 0.0
                 return fn(*args)
             except SERIAL_ERRORS as e:
                 log.error("%s: serial error: %s", self.name, e)
@@ -276,22 +330,52 @@ class AR488Adapter:
     def write(self, addr, data, end=True):
         return self._run(self._write, addr, data, end)
 
+    @staticmethod
+    def _escaped_lines(data, line_max):
+        """Split data into ESC-escaped lines of at most line_max bytes (plus LF)."""
+        lines, cur = [], bytearray()
+        for b in data:
+            n = 2 if b in ESCAPE_BYTES else 1
+            if len(cur) + n > line_max:
+                lines.append(cur)
+                cur = bytearray()
+            if n == 2:
+                cur.append(0x1B)
+            cur.append(b)
+        lines.append(cur)
+        return [bytes(l) for l in lines]
+
     def _write(self, addr, data, end):
         self.ser.reset_input_buffer()
         self._set_addr(addr)
-        chunks = [data[i:i + WRITE_CHUNK] for i in range(0, len(data), WRITE_CHUNK)] or [b""]
-        for i, chunk in enumerate(chunks):
-            last = i == len(chunks) - 1
-            self._set_eoi(end and last)
-            esc = bytearray()
-            for b in chunk:
-                if b in ESCAPE_BYTES:
-                    esc.append(0x1B)
-                esc.append(b)
-            self.ser.write(bytes(esc) + b"\n")
-            # The AR488 has no flow control and only a 64-byte UART buffer:
-            # anything sent while it is still clocking this line out on GPIB
-            # can be dropped. Wait until it has finished before sending more.
+        # The AR488 has no flow control: while it is clocking one line out on
+        # GPIB, what follows waits in its serial input buffer (64 bytes on stock
+        # firmware) and anything beyond that is dropped. So never have more
+        # unconfirmed bytes outstanding than fit; _sync() confirms.
+        if self.rxbuf > 64:
+            lines = self._escaped_lines(data, LINE_MAX)
+            budget = self.rxbuf - 16           # room for ++eoi / ++addr lines
+        else:
+            lines = [l for i in range(0, max(len(data), 1), WRITE_CHUNK)
+                     for l in self._escaped_lines(data[i:i + WRITE_CHUNK], 2 * WRITE_CHUNK)]
+            budget = 0                         # one line, then sync
+        outstanding = 0
+        for i, line in enumerate(lines):
+            last = i == len(lines) - 1
+            if self._eoi != (end and last):
+                cmd = f"++eoi {1 if end and last else 0}\n".encode()
+            else:
+                cmd = b""
+            if outstanding and outstanding + len(cmd) + len(line) + 1 > budget:
+                self._sync()
+                outstanding = 0
+            self.ser.write(cmd + line + b"\n")
+            self._eoi = end and last if cmd else self._eoi
+            outstanding += len(cmd) + len(line) + 1
+            if budget == 0:
+                self._sync()
+                outstanding = 0
+        if outstanding:
             self._sync()
         self._set_eoi(True)
 
@@ -322,13 +406,31 @@ class AR488Adapter:
         wait = self._tmo / 1000 + RETRY_MARGIN_S
         deadline = time.monotonic() + timeout_s
         buf = bytearray()
+        dle = False                   # escaped mode: previous byte was DLE
         while True:
             self._cmd("++read eoi")
+            issued = time.monotonic()
             # AR488 gives up silently after read_tmo_ms with no data; if the
             # client allows longer than that, ask again.
             retry_at = time.monotonic() + wait
             while True:
                 n = self.ser.in_waiting
+                if n and self.eot_esc:
+                    # gpibpi firmware: data EOT/DLE bytes arrive as DLE x, so an
+                    # unescaped EOT is always the end of the reply
+                    for b in self.ser.read(n):
+                        if dle:
+                            buf.append(b)
+                            dle = False
+                        elif b == DLE:
+                            dle = True
+                        elif b == EOT:
+                            self.eoi_seen.add(addr)
+                            return bytes(buf)
+                        else:
+                            buf.append(b)
+                    retry_at = time.monotonic() + wait
+                    continue
                 if n:
                     buf += self.ser.read(n)
                     retry_at = time.monotonic() + wait
@@ -350,6 +452,7 @@ class AR488Adapter:
                             else:
                                 log.warning("%s: addr %d read ended without EOI", self.name, addr)
                         return bytes(buf)
+                    self._busy_until = issued + self._tmo / 1000 + RETRY_MARGIN_S
                     raise ReadTimeout()
                 if now >= retry_at:
                     break     # firmware timed out with nothing: re-issue ++read
@@ -693,10 +796,10 @@ def load_config(path):
         # ones get the next free gpibN, pinned to their physical USB port
         with DISCOVERY_LOCK:
             found = discover()
-        names = {n.lower() for _, n in found.values() if n}
+        names = {n.lower() for _, n, _ in found.values() if n}
         ifaces = [{"name": n} for n in sorted(names)]
         i = 0
-        for p, (_, n) in sorted(found.items()):
+        for p, (_, n, _) in sorted(found.items()):
             if not n:
                 while f"gpib{i}" in names:
                     i += 1
@@ -724,7 +827,7 @@ def main():
         logging.getLogger(lib).setLevel(logging.DEBUG if args.verbose else logging.WARNING)
 
     for i in ifaces:
-        a = AR488Adapter(i["name"].lower(), i.get("port"), i.get("baud", 115200),
+        a = AR488Adapter(i["name"].lower(), i.get("port"), i.get("baud"),
                          i.get("reset_delay", 2.5), i.get("ifc_on_open", True),
                          i.get("no_eoi", []), i.get("auto_no_eoi", True),
                          i.get("no_eoi_tmo_ms", NO_EOI_TMO_MS))

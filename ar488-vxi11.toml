@@ -28,7 +28,7 @@ name = "gpib2"          # Nano clone (CH340): Agilent 54624A
 
 # Optional per-interface settings:
 # port = "/dev/serial/by-id/..."  # fixed port instead of finding it by name
-# baud = 115200
+# baud = 500000         # default: found automatically (500000, then 115200)
 # reset_delay = 2.5     # seconds to wait after opening (Arduino resets on open)
 # ifc_on_open = true    # pulse IFC when the adapter is opened
 # no_eoi = [9, 22]      # addresses that never assert EOI on replies; their reads

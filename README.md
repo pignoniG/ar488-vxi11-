@@ -20,6 +20,7 @@ TCPIP::<pi-ip>::inst0::INSTR         # the gateway itself (see "Gateway queries"
 | `ar488-vxi11.service` | systemd unit (runs as user `ar488gw`, group `dialout`) |
 | `install.sh` | installs to `/opt/ar488-vxi11`, enables rpcbind + the service |
 | `test_client.py` | PyVISA client for testing / scanning a bus over the network |
+| `tests/hw_tests.py` | tests against the bench instruments (parallel use, FIFO, locks, binary, speed) |
 | `docs/firmware.md` | AR488 firmware: the patches, build, flash, restore, adapter details |
 
 ## Install / update
@@ -35,9 +36,9 @@ journalctl -u ar488-vxi11 -f
 
 | bus | adapter | firmware |
 |---|---|---|
-| gpib0 | Nano clone, CH340 | AR488 0.53.46, patched |
-| gpib1 | Nano original, FTDI FT232R `AC008SFE` | AR488 0.53.46, patched |
-| gpib2 | Nano clone, CH340 | AR488 0.53.46, patched |
+| gpib0 | Nano clone, CH340 | AR488 0.53.46-gpibpi2, 500000 baud |
+| gpib1 | Nano original, FTDI FT232R `AC008SFE` | AR488 0.53.46-gpibpi2, 500000 baud |
+| gpib2 | Nano clone, CH340 | AR488 0.53.46-gpibpi2, 500000 baud |
 
 **Each adapter carries its bus name** in its own EEPROM (`++id name`). At
 startup the gateway probes every USB serial port and assigns buses by the
@@ -49,22 +50,29 @@ To name a new adapter (once, with the gateway stopped):
 
 ```
 sudo systemctl stop ar488-vxi11
-python3 -c "import serial,time; s=serial.Serial('/dev/ttyUSB0',115200); time.sleep(2.5); s.write(b'++id name gpib3\n++savecfg\n'); time.sleep(0.5)"
+python3 -c "import serial,time; s=serial.Serial('/dev/ttyUSB0',500000); time.sleep(2.5); s.write(b'++id name gpib3\n++savecfg\n'); time.sleep(0.5)"
 ```
+
+(Use 115200 for an adapter with stock firmware.)
 
 then add `[[interface]] name = "gpib3"` to `/etc/ar488-vxi11.toml` and start the
 gateway again.
 
-All adapters use SN75160/SN75161 bus drivers (TE = D6, DC = D13). How the
-firmware is patched, built and flashed is in [docs/firmware.md](docs/firmware.md).
-The firmware source, built `.hex` and backups of the original firmware are in
-`~/Documents/ar488-firmware` on the Pi (not in this repo).
+All adapters use SN75160/SN75161 bus drivers (TE = D6, DC = D13). They run
+AR488 from the fork [pignoniG/AR488](https://github.com/pignoniG/AR488), branch
+`gpibpi`. What it changes, and how to build and flash it, is in
+[docs/firmware.md](docs/firmware.md).
 
-**Firmware requirements:** the gateway works with 0.51.x, and with 0.53.46 *only
-with two patches*. Stock 0.53.46 sends the end-of-reply marker as the text `4`
-instead of byte 0x04, so every read would hang until timeout. Its `++fndl` also
-leaves the bus in a state where the next write is lost. `LISTENERS?` needs 0.53
-or newer.
+**Firmware requirements:** the gateway works with stock 0.51.x and with 0.53.46
+*with two fixes* (both in the fork). Stock 0.53.46 sends the end-of-reply marker
+as the text `4` instead of byte 0x04, so every read would hang until timeout.
+Its `++fndl` also leaves the bus in a state where the next write is lost.
+`LISTENERS?` needs 0.53 or newer. The fork's gpibpi2 additions are used when
+present:
+* **500000 baud.** The gateway tries 500000, then 115200.
+* **Escaped end-of-reply marker** (`++eot_escape`): binary-safe reads, and no
+  20 ms wait at the end of each reply.
+* **256-byte input buffer** (`++rxbuf`): fewer round trips on long writes.
 
 ## Gateway queries (`inst0`)
 
@@ -96,11 +104,20 @@ replies end at normal speed. `no_eoi` can stay set either way.
   per-connection bridges like ser2net would lose state on every connect.
 * Adapter setup: `++mode 1`, `++auto 0`, `++eos 3` (data is passed through
   as-is, so the client's own `\n` terminator is used), `++eoi 1`, `++eot_enable 1`,
-  `++eot_char 4`. Every read is `++read eoi`, and the 0x04 byte the adapter
-  appends on EOI marks the end of the response.
+  `++eot_char 4`, and `++eot_escape 1` where the firmware has it. Every read is
+  `++read eoi`, and the 0x04 byte the adapter appends on EOI marks the end of
+  the response. With `++eot_escape 1`, data bytes 0x04 and 0x10 arrive as
+  0x10 + byte, so an unescaped 0x04 is always the end.
+* The serial speed is found when an adapter is opened: 500000 baud is tried
+  first, then 115200. Changing speed on an open port doesn't reset the
+  Arduino.
 * Data bytes LF/CR/ESC/`+` are ESC-escaped, so binary writes are safe. Writes
-  go out in 48-byte lines, with EOI only on the last byte when the client
-  sets END.
+  go out in 110-byte lines, two per confirmation round trip (gpibpi2's 256-byte
+  input buffer), or in 48-byte lines, one per round trip (stock 64-byte
+  buffer). EOI is asserted only on the last byte, when the client sets END.
+* If a client's read times out while the adapter is still waiting inside its
+  own `++read` (which can't be interrupted), the next operation on that bus
+  first waits for the adapter to finish (at most 3 s) instead of failing.
 * **Several clients at once.** Each bus has its own lock, so instruments on
   different adapters are used fully in parallel: a slow measurement on gpib1
   doesn't delay gpib0 (tested: gpib0 `*IDN?` in 0.04 s while gpib1 waits on a
@@ -148,9 +165,12 @@ replies end at normal speed. `no_eoi` can stay set either way.
   client holds it: retry it in a loop. NI-VISA waits up to its lock timeout.
 * Serial poll of the HP 3456A only works with AR488 0.53. Firmware 0.51.15
   never answered `++spoll` for it.
-* The adapter has no serial flow control and a 64-byte buffer. The gateway
-  therefore waits for each 48-byte chunk to be written (an `++addr` round trip)
-  before sending more. This costs a few ms per 48 bytes (upload speed not measured).
+* The adapter has no serial flow control. The gateway therefore never sends
+  more than fits in its input buffer before an `++addr` round trip confirms
+  it. A 999-byte write takes about 0.17 s with gpibpi2.
+* Transfer speed is about 16 kB/s (61 µs per byte) with gpibpi2 at 500000
+  baud. That is the firmware's per-byte GPIB handshake loop or the
+  instrument, not the serial link. It was about 10 kB/s at 115200.
 * Instruments that send no EOI (`no_eoi`, or detected automatically: the first
   read then takes ~3 s) have their replies ended by 200 ms of silence. A binary
   reply that pauses longer than that mid-transfer would be cut short.
@@ -162,8 +182,9 @@ replies end at normal speed. `no_eoi` can stay set either way.
   until the client's VISA timeout expires, so long measurements still work.
 * The FTDI adapter's device node belongs to group `plugdev` (udev rules from
   openocd/flashrom), so the service runs with `SupplementaryGroups=plugdev`.
-* Binary responses containing byte 0x04 followed by a pause of more than 20 ms
-  could be cut short. In practice the adapter streams continuously.
+* With firmware other than gpibpi2 (no `++eot_escape`), binary responses
+  containing byte 0x04 followed by a pause of more than 20 ms could be cut
+  short. In practice the adapter streams continuously.
 * Needs Python ≤ 3.12 (`xdrlib`). Bookworm's system Python 3.11 is fine.
 
 ### Library patches (in `vxi11_server/instrument_server.py`)
@@ -194,6 +215,8 @@ print(dmm.query("READ?"))
 ```
 
 ```
+python3 tests/hw_tests.py                            # bench tests (on the Pi); SKIPs instruments that are off
+python3 tests/hw_tests.py fifo binary                # selected tests
 python3 test_client.py 192.168.1.187                 # gateway + gpib0,16 *IDN?
 python3 test_client.py 192.168.1.187 --scan gpib1    # find instruments on bus 1
 ```
