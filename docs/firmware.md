@@ -7,9 +7,18 @@ D12 is EOI.
 
 They run AR488 **0.53.46**
 ([Twilight-Logic/AR488](https://github.com/Twilight-Logic/AR488) `src/AR488`,
-GPL-3.0) with the three changes below. The source tree, built `.hex` and the
-backups of the original firmware are kept on the Pi in `~/Documents/ar488-firmware`,
-not in this repository:
+GPL-3.0) with the three changes below. They are committed in the fork
+[pignoniG/AR488](https://github.com/pignoniG/AR488):
+
+* branch [`gpibpi`](https://github.com/pignoniG/AR488/tree/gpibpi): the firmware
+  exactly as flashed (both fixes, the bus-driver config, and `build-nano-debian.sh`).
+  Building it gives the same `.hex`, byte for byte (sha256 below).
+* branch [`fix-eot-fndl`](https://github.com/pignoniG/AR488/tree/fix-eot-fndl): only
+  the two bug fixes, on top of upstream `master`, for a pull request upstream.
+
+On the Pi, the fork is cloned at `~/Documents/AR488`. The original working
+copy, built `.hex` and the backups of the original firmware are in
+`~/Documents/ar488-firmware`:
 
 | folder | what |
 |---|---|
@@ -81,6 +90,10 @@ All three were flashed on 2026-11-07 with `AR488_0.53.46_nano_sn7516x_te6_dc13.h
 three talk at 115200.
 
 ## Build
+
+From the fork: `git clone -b gpibpi https://github.com/pignoniG/AR488.git`,
+then `./build-nano-debian.sh`. This script is the same as the one below, with
+paths for the repository layout (`src/AR488`).
 
 With Debian's Arduino packages (bookworm: arduino-core-avr 1.8.7, avr-gcc 5.4):
 
