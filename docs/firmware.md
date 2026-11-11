@@ -14,7 +14,8 @@ GPL-3.0) with the three changes below. They are committed in the fork
   exactly as flashed (both fixes, the bus-driver config, and `build-nano-debian.sh`).
   Building it gives the same `.hex`, byte for byte (sha256 below).
 * branch [`fix-eot-fndl`](https://github.com/pignoniG/AR488/tree/fix-eot-fndl): only
-  the two bug fixes, on top of upstream `master`, for a pull request upstream.
+  the two bug fixes on top of upstream `master`. The upstream repository is
+  archived, so the fixes live in this fork.
 
 On the Pi, the fork is cloned at `~/Documents/AR488`. The original working
 copy, built `.hex` and the backups of the original firmware are in
@@ -69,7 +70,8 @@ addressed" flag set to *listen*. The next data write then skips addressing the
 selected device, and the data is lost. The query after a `LISTENERS?` would
 time out.
 
-Changes 2 and 3 are upstream bugs worth reporting.
+Changes 2 and 3 fix bugs in upstream 0.53.46. Upstream is archived, so they
+are kept in the fork.
 
 ## Adapters
 
