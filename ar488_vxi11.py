@@ -850,7 +850,11 @@ def main():
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
     signal.signal(signal.SIGINT, lambda *a: stop.set())
     stop.wait()
-    server.close()
+    try:
+        server.close()
+    except OSError as e:
+        # at system shutdown rpcbind may already be gone: nothing to unregister from
+        log.info("portmapper unregister skipped: %s", e)
     for a in ADAPTERS.values():
         a.close()
     return 0
