@@ -10,6 +10,7 @@ needs to be installed.
 Instruments (change INSTR below for another bench):
   k2000  gpib0,16  Keithley 2000           h3456  gpib1,22  HP 3456A
   h3245  gpib1,9   HP 3245A (no EOI)       scope  gpib2,8   Agilent 54624A
+  k2000s asrl0     Keithley 2000 on RS-232 (the same meter: one interface at a time)
 """
 import argparse
 import os
@@ -24,7 +25,8 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from vxi11_server import vxi11, rpc  # noqa: E402
 
-INSTR = {"k2000": "gpib0,16", "h3456": "gpib1,22", "h3245": "gpib1,9", "scope": "gpib2,8"}
+INSTR = {"k2000": "gpib0,16", "h3456": "gpib1,22", "h3245": "gpib1,9", "scope": "gpib2,8",
+         "k2000s": "asrl0"}
 HOST = "127.0.0.1"
 
 
@@ -41,9 +43,13 @@ def dev(name, timeout=10):
 
 def need(*names):
     """Skip the test unless every named instrument answers."""
-    probes = {"k2000": "*IDN?", "scope": "*IDN?", "h3245": "ID?"}
+    probes = {"k2000": "*IDN?", "scope": "*IDN?", "h3245": "ID?", "k2000s": "*IDN?"}
     for n in names:
-        d = dev(n, 3)
+        try:
+            d = dev(n, 3)
+            d.client.sock.settimeout(15)      # a write to an empty address can take a while
+        except Exception:
+            raise Skip(f"{n} ({INSTR[n]}) not available")
         try:
             if n == "h3456":
                 d.read_stb()
@@ -52,7 +58,10 @@ def need(*names):
         except Exception:
             raise Skip(f"{n} ({INSTR[n]}) not answering")
         finally:
-            d.close()
+            try:
+                d.close()
+            except Exception:
+                pass
 
 
 def check(cond, msg):
@@ -295,6 +304,39 @@ def t_speed():
     out.append(f"K2000 *IDN? {(time.time()-t)*100:.0f} ms")
     k.close()
     return ", ".join(out)
+
+
+def t_serial():
+    """RS-232 Keithley: queries, readings, emulated serial poll, local/remote, clear,
+    three clients at once through the FIFO, and a clean error queue afterwards."""
+    need("k2000s")
+    k = dev("k2000s")
+    check("KEITHLEY" in k.ask("*IDN?"), "bad *IDN?")
+    t = time.time()
+    for _ in range(10):
+        check(re.match(r"^[+-]\d\.\d+E[+-]\d+$", k.ask(":FETCH?").strip()), "bad reading")
+    per = (time.time() - t) / 10
+    stb = k.read_stb()
+    k.local()
+    k.write(":SYST:REM")
+    k.clear()
+    check("KEITHLEY" in k.ask("*IDN?"), "no answer after clear")
+    bad = []
+
+    def client(cmd, pat):
+        d = dev("k2000s")
+        for _ in range(10):
+            r = d.ask(cmd).strip()
+            if not re.search(pat, r):
+                bad.append((cmd, r))
+        d.close()
+    threads(lambda: client("*IDN?", "KEITHLEY"), lambda: client(":FETCH?", r"E[+-]\d+$"),
+            lambda: client(":SENS:FUNC?", r'^"[A-Z:]+"$'))
+    err = k.ask(":SYST:ERR?").strip()
+    k.close()
+    check(not bad, f"wrong answers: {bad[:3]}")
+    check(err.startswith(("0", "+0")), f"Keithley reports {err}")
+    return f":FETCH? {per*1000:.0f} ms, stb {stb}, 30/30 FIFO answers correct, no instrument errors"
 
 
 def t_listeners():

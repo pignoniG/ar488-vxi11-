@@ -119,10 +119,11 @@ const ago = t => { if (!t) return "never"; const s = Math.max(0, (Date.now()/100
 const dur = s => { s = Math.round(s); const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
   return d ? `${d} d ${h} h` : h ? `${h} h ${m} min` : m ? `${m} min` : `${s} s`; };
 const hms = t => new Date(t*1000).toLocaleTimeString([], {hour12:false});
-const short = s => s ? s.replace(/^\/dev\/serial\/by-(path|id)\//, "").replace(/^platform-.*-usb-0:/, "USB ").replace(/:1\.0-port0$/, "") : "";
+const short = s => s ? s.replace(/^\/dev\/serial\/by-(path|id)\//, "").replace(/^platform-.*-usb-0:/, "USB ").replace(/:1\.0-port0$/, "").replace(/^usb-/, "").replace(/-if\d\d-port\d$/, "").replace(/_/g, " ") : "";
 const ver = v => (v || "").replace(/^AR488 GPIB controller, ver\. /, "").replace(/, .*$/, "");
-const instName = i => i.aliases.length ? i.aliases[0] : (i.idn ? i.idn.split(",").slice(0,2).join(" ").slice(0,28) : `address ${i.addr}`);
-const allInst = () => S ? S.buses.flatMap(b => b.instruments.map(i => ({...i, bus:b.name}))) : [];
+const instName = i => i.aliases.length ? i.aliases[0] : (i.idn ? i.idn.split(",").slice(0,2).join(" ").slice(0,28) : i.addr !== undefined ? `address ${i.addr}` : i.name);
+const allInst = () => S ? S.buses.flatMap(b => b.instruments.map(i => ({...i, bus:b.name}))).concat((S.serial || []).map(i => ({...i, bus:"rs232"}))) : [];
+const BAUDS = [300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200];
 const canEdit = () => S && S.auth.logged_in;
 const needLogin = () => canEdit() ? "" : `<div class="card" style="margin-bottom:12px"><span class="sub">${S && S.auth.has_password ? "Read-only. <a href='#settings'>Log in</a> to make changes." : "Read-only. <a href='#settings'>Set a password</a> to enable changes."}</span></div>`;
 
@@ -145,6 +146,13 @@ function busCard(b) {
    <div class="mut" style="margin:2px 0 8px">${esc(short(b.port)) || "no port"} · ${esc(ver(b.version))} · ${b.baud || "?"} baud${b.eot_esc ? " · escaped EOT" : ""}</div>${rows}
    ${b.last_error ? `<div class="mut" style="margin-top:6px">last error: ${esc(b.last_error)}</div>` : ""}</div>`;
 }
+function serialCard() {
+  const L = S.serial || []; if (!L.length) return "";
+  return `<div class="card"><div class="bar" style="justify-content:space-between"><h2 style="margin:0">RS-232</h2><span class="pill">${L.length} instrument${L.length === 1 ? "" : "s"}</span></div>
+   ${L.map(i => `<div class="row" style="align-items:flex-start"><span><b style="font-weight:500">${esc(i.name)}</b>${i.aliases.length ? " · " + esc(i.aliases.join(", ")) : ""}${i.idn ? `<div class="mut">${esc(i.idn.split(",").slice(0,2).join(" "))}</div>` : ""}<div class="mut">${esc(short(i.port))} · ${esc(i.settings)}</div></span>
+     <span class="bar" style="gap:4px;justify-content:flex-end"><span class="pill ${i.state === "ready" ? (i.serial_errors ? "warn" : "ok") : "bad"}">${i.state === "ready" ? "ready" : i.present ? "not open" : "unplugged"}</span>${i.locked_by ? `<span class="pill acc">locked ${esc(i.locked_by)}</span>` : ""}${i.waiting ? `<span class="pill acc">queue ${i.waiting}</span>` : ""}
+     <span class="mut">${i.rate ? i.rate + " op/s" : (i.last ? ago(i.last) : "idle")}</span></span></div>`).join("")}</div>`;
+}
 function healthRows(h) {
   const uv = h.undervoltage_now ? '<span class="pill bad">undervoltage now</span>' : h.uv_last_hour ? `<span class="pill warn">${h.uv_last_hour}× in the last hour</span>` : '<span class="pill ok">OK</span>';
   return `<div class="row"><span>Power</span>${uv}</div>
@@ -161,7 +169,7 @@ PAGES_RENDER.dashboard = {
   render() { $("#page").innerHTML = `<div class="bar" style="justify-content:flex-end;margin:-6px 0 12px"><button onclick="scan()">Scan buses</button></div>
     <div class="grid g3" id="buses"></div><div class="grid g2" style="margin-top:12px"><div class="card"><h2>Clients</h2><div id="dcl"></div></div><div class="card"><h2>Pi health</h2><div id="dh"></div></div></div>
     <div class="card" style="margin-top:12px"><h2>Recent events</h2><div id="dev"></div></div>`; this.live(); },
-  live() { if (!S) return; $("#buses").innerHTML = S.buses.map(busCard).join(""); $("#dcl").innerHTML = clientRows(S.clients);
+  live() { if (!S) return; $("#buses").innerHTML = S.buses.map(busCard).join("") + serialCard(); $("#dcl").innerHTML = clientRows(S.clients);
     $("#dh").innerHTML = healthRows(S.health); $("#dev").innerHTML = eventRows(S.events); }
 };
 async function scan() {
@@ -179,12 +187,12 @@ PAGES_RENDER.instruments = {
   },
   live() {
     if (!S || document.activeElement && document.activeElement.closest && document.activeElement.closest("#iedit")) return;
-    $("#itab").innerHTML = S.buses.map(b => b.instruments.map(i => `<tr>
-      <td><span class="mono">${esc(i.key)}</span>${i.listening === false ? ' <span class="pill">not seen</span>' : ""}${i.no_eoi ? ' <span class="pill warn">no EOI</span>' : ""}</td>
+    $("#itab").innerHTML = allInst().map(i => `<tr>
+      <td><span class="mono">${esc(i.key)}</span>${i.bus === "rs232" ? ` <span class="pill acc">RS-232</span><div class="mut">${esc(i.settings)}${i.state === "ready" ? "" : " · " + esc(i.state)}</div>` : ""}${i.listening === false ? ' <span class="pill">not seen</span>' : ""}${i.no_eoi ? ' <span class="pill warn">no EOI</span>' : ""}</td>
       <td>${i.aliases.map(a => `<span class="pill acc">${esc(a)}</span>`).join(" ") || '<span class="mut">none</span>'}</td>
       <td>${esc(i.idn) || '<span class="mut">unknown</span>'}${i.note ? `<div class="mut">${esc(i.note)}</div>` : ""}</td>
       <td class="mut">${i.ops} ops${i.errors ? `, <span class="err">${i.errors} errors</span>` : ""}<br>${i.last ? ago(i.last) + " · " + esc(i.last_client) : "never used"}</td>
-      <td style="text-align:right"><div class="bar" style="justify-content:flex-end;gap:4px"><button class="sm" onclick="showSnip('${i.key}')">Connect</button><button class="sm" onclick="editInst('${i.key}')">Edit</button><button class="sm" onclick="location.hash='console/${i.key}'">Console</button></div></td></tr>`).join("")).join("")
+      <td style="text-align:right"><div class="bar" style="justify-content:flex-end;gap:4px"><button class="sm" onclick="showSnip('${i.key}')">Connect</button><button class="sm" onclick="editInst('${i.key}')">Edit</button><button class="sm" onclick="location.hash='console/${i.key}'">Console</button></div></td></tr>`).join("")
       || `<tr><td colspan="5" class="mut">No instruments known yet. Use Scan buses.</td></tr>`;
   }
 };
@@ -399,7 +407,7 @@ async function discon(id, ip) { if (!confirm(`Disconnect ${ip}?`)) return; await
 /* ---------------- settings ---------------- */
 PAGES_RENDER.settings = {
   async render() {
-    let cfg; try { cfg = await api("/api/config"); } catch (e) { $("#page").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+    let cfg, ports = []; try { cfg = await api("/api/config"); ports = (await api("/api/ports")).ports; } catch (e) { $("#page").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
     const A = S.auth, dis = canEdit() ? "" : "disabled";
     const authCard = !A.has_password ? `<div class="card"><h2>Set a password</h2><div class="sub" style="margin-bottom:8px">Anyone on the network can view this page. Changing anything, including the console and logger, needs this password.</div>
         <div class="bar"><input type="password" id="pw1" placeholder="new password" autocomplete="new-password"><input type="password" id="pw2" placeholder="repeat" autocomplete="new-password"><button class="pri" onclick="setPw()">Set password</button></div><div id="pwmsg"></div></div>`
@@ -422,6 +430,12 @@ PAGES_RENDER.settings = {
         <label class="f" style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" id="i-${i.name}-ifc" ${i.ifc_on_open ? "checked" : ""} ${dis}>pulse IFC when opening</label></div>
         ${i.overridden.length ? `<div class="mut" style="margin-top:6px">Changed here: ${i.overridden.join(", ")}</div>` : ""}
         <div class="bar" style="margin-top:10px"><button class="pri" onclick="saveIface('${i.name}')" ${dis}>Save</button>${i.overridden.length ? `<button onclick="resetOv('${i.name}')" ${dis}>Use config file values</button>` : ""}</div></div>`).join("")}
+      <datalist id="r-ports">${ports.filter(p => p.kind === "id").map(p => `<option value="${esc(p.path)}">${esc(p.name)}${p.used_by ? " · " + esc(p.used_by) : " · free"}</option>`).join("")}</datalist>
+      ${cfg.serial.map(c => serialForm(c, false, dis)).join("")}
+      ${serialForm({}, true, dis)}
+      <div class="card" style="margin-top:12px"><h2>Serial ports</h2><div class="tw"><table><thead><tr><th>Port</th><th>Device</th><th>Used by</th></tr></thead><tbody>
+      ${ports.map(p => `<tr><td class="mono" style="word-break:break-all">${esc(p.path)}</td><td class="mono">${esc(p.dev)}</td><td>${esc(p.used_by) || '<span class="mut">free</span>'}</td></tr>`).join("") || '<tr><td colspan="3" class="mut">No USB serial ports</td></tr>'}</tbody></table></div>
+      <div class="mut" style="margin-top:6px">Use the by-id name for RS-232 instruments: it follows the cable to any USB socket. Ports used by RS-232 instruments are never probed for AR488 adapters.</div></div>
       <div class="card" style="margin-top:12px"><h2>Backup</h2><div class="sub" style="margin-bottom:8px">Aliases, instrument notes, settings changed here and logger jobs. The password isn't included.</div>
       <div class="bar"><a class="btn" style="text-decoration:none" href="/api/export">Download settings</a><label class="btn">Restore from file<input type="file" accept=".json" class="hide" onchange="importCfg(this)" ${dis}></label></div>
       <div class="mut" style="margin-top:8px">Base config: <span class="mono">${esc(cfg.config_file)}</span> · changes made here: <span class="mono">${esc(cfg.state_file)}</span></div></div>`;
@@ -447,6 +461,58 @@ async function saveIface(n) {
     no_eoi_tmo_ms:+v("tmo").value, auto_no_eoi:v("auto").checked, ifc_on_open:v("ifc").checked}}}), "Saved");
   if (r) { (r.notes || []).forEach(x => toast(x)); route(); }
 }
+function serialForm(c, isNew, dis) {
+  const id = isNew ? "new" : c.name;
+  const sel = (key, v, list) => `<select id="r-${id}-${key}" ${dis}>${list.map(([val, txt]) => `<option value="${val}" ${String(val) === String(v) ? "selected" : ""}>${txt}</option>`).join("")}</select>`;
+  const inp = (key, v, ph) => `<input id="r-${id}-${key}" value="${esc(v || "")}" placeholder="${esc(ph)}" ${dis}>`;
+  return `<div class="card" style="margin-top:12px"><div class="bar" style="justify-content:space-between"><h2 style="margin:0">${isNew ? "Add an RS-232 instrument" : esc(c.name) + ' <span class="pill acc">RS-232</span>'}</h2>
+    ${isNew ? "" : `<button class="sm" onclick="adapter('${c.name}','reopen')" ${dis}>Reopen</button>`}</div>
+    <div class="form" style="margin-top:8px">
+    ${isNew ? `<label class="f">Name, used in VISA strings${inp("name", "", "dmm2")}</label>` : ""}
+    <label class="f" style="grid-column:span 2">Port<input id="r-${id}-port" list="r-ports" value="${esc(c.port || "")}" placeholder="/dev/serial/by-id/…" ${dis}></label>
+    <label class="f">Speed (baud)${sel("baud", c.baud || 9600, BAUDS.map(b => [b, b]))}</label>
+    <label class="f">Data bits${sel("data_bits", c.data_bits || 8, [[8,8],[7,7],[6,6],[5,5]])}</label>
+    <label class="f">Parity${sel("parity", c.parity || "N", [["N","none"],["E","even"],["O","odd"],["M","mark"],["S","space"]])}</label>
+    <label class="f">Stop bits${sel("stop_bits", c.stop_bits || 1, [[1,1],[1.5,1.5],[2,2]])}</label>
+    <label class="f">Flow control${sel("flow", c.flow || "none", [["none","none"],["xonxoff","XON/XOFF"],["rtscts","RTS/CTS"],["dsrdtr","DSR/DTR"]])}</label>
+    <label class="f">Line end sent${sel("write_termination", c.write_termination || "lf", [["lf","LF"],["cr","CR"],["crlf","CR LF"],["lfcr","LF CR"]])}</label>
+    <label class="f">Line end of replies${sel("read_termination", c.read_termination || "auto", [["auto","CR or LF (auto)"],["lf","LF"],["cr","CR"],["crlf","CR LF"],["lfcr","LF CR"]])}</label>
+    <label class="f">Status byte query${inp("stb_query", c.stb_query, "*STB?  (none: no serial poll)")}</label>
+    <label class="f">Trigger command${inp("trigger_cmd", isNew ? "*TRG" : c.trigger_cmd, "*TRG")}</label>
+    <label class="f">Go to local${inp("local_cmd", c.local_cmd, ":SYST:LOC")}</label>
+    <label class="f">Go to remote${inp("remote_cmd", c.remote_cmd, ":SYST:REM")}</label>
+    <label class="f">Device clear sends${inp("clear_cmd", c.clear_cmd, "nothing, buffers are flushed")}</label>
+    <label class="f" style="grid-column:span 2">Description${inp("description", c.description, "Keithley 2000 on the rear RS-232")}</label></div>
+    ${!isNew && c.overridden.length ? `<div class="mut" style="margin-top:6px">Changed here: ${c.overridden.join(", ")}</div>` : ""}
+    <div class="bar" style="margin-top:10px"><button class="pri" onclick="saveSerial('${id}')" ${dis}>${isNew ? "Add" : "Save"}</button><button onclick="probeSerial('${id}')" ${dis}>Find settings</button>
+    ${!isNew && c.origin === "web" ? `<button class="danger" onclick="delSerial('${id}')" ${dis}>Delete</button>` : ""}${!isNew && c.overridden.length ? `<button onclick="resetOv('${id}')" ${dis}>Use config file values</button>` : ""}
+    <span class="mut">${isNew ? "" : c.origin === "web" ? "Added on this page. " : "From the config file. "}Find settings sends *IDN? at common speeds (8N1); the instrument may log errors for the wrong ones.</span></div></div>`;
+}
+async function saveSerial(id) {
+  const v = k => $(`#r-${id}-${k}`).value;
+  const name = id === "new" ? v("name").trim().toLowerCase() : id;
+  if (!name) { toast("Enter a name first", true); return; }
+  if (!v("port").startsWith("/dev/")) { toast("Pick a port first", true); return; }
+  const body = {name, port:v("port").trim(), baud:+v("baud"), data_bits:+v("data_bits"), parity:v("parity"), stop_bits:+v("stop_bits"),
+    flow:v("flow"), write_termination:v("write_termination"), read_termination:v("read_termination"), stb_query:v("stb_query"),
+    trigger_cmd:v("trigger_cmd"), local_cmd:v("local_cmd"), remote_cmd:v("remote_cmd"), clear_cmd:v("clear_cmd"), description:v("description")};
+  if (await act(() => api("/api/serial/save", body), r => r.message)) { await refresh(); route(); }
+}
+async function probeSerial(id) {
+  const port = $(`#r-${id}-port`).value.trim();
+  if (!port.startsWith("/dev/")) { toast("Pick a port first", true); return; }
+  if (!confirm(`Send *IDN? to ${port} at several speeds to find its settings? Takes up to half a minute.`)) return;
+  toast("Searching… up to 30 s");
+  const r = await act(() => api("/api/serial/probe", {port}));
+  if (!r) return;
+  if (!r.found) { toast("No answer at any common speed. Check the cable (null-modem?) and that the instrument's RS-232 is enabled.", true); return; }
+  const f = r.found;
+  $(`#r-${id}-baud`).value = String(f.baud); $(`#r-${id}-write_termination`).value = f.write_termination;
+  $(`#r-${id}-data_bits`).value = "8"; $(`#r-${id}-parity`).value = "N"; $(`#r-${id}-stop_bits`).value = "1";
+  if ($(`#r-${id}-description`).value === "") $(`#r-${id}-description`).value = f.reply.split(",").slice(0,2).join(" ");
+  toast(`Found ${f.baud} baud, sends ${f.write_termination.toUpperCase()}, replies end in ${f.reply_termination.toUpperCase()}: ${f.reply}. Save to keep it.`);
+}
+async function delSerial(id) { if (!confirm(`Delete the RS-232 instrument ${id}?`)) return; if (await act(() => api("/api/serial/delete", {name:id}), "Deleted")) { await refresh(); route(); } }
 async function resetOv(section) { const r = await act(() => api("/api/settings/reset", {section})); if (r) { r.notes.forEach(x => toast(x)); route(); } }
 async function adapter(bus, action) {
   if (action === "store_name" && !confirm(`Write the name "${bus}" into the adapter's EEPROM?`)) return;

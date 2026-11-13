@@ -80,7 +80,7 @@ class State:
         except (OSError, ValueError) as e:
             log.error("can't read %s (%s), starting with empty web state", self.path, e)
         for k, v in (("aliases", {}), ("instruments", {}), ("overrides", {}),
-                     ("logger", []), ("web", {})):
+                     ("logger", []), ("web", {}), ("serial", {})):
             self.data.setdefault(k, v)
 
     def save(self):
@@ -94,6 +94,20 @@ class State:
 
     def aliases(self):
         return dict(self.data["aliases"])
+
+    def apply_serial(self, toml_cfgs):
+        """[[serial]] entries from the config file with web overrides, plus serial
+        instruments added on the web page."""
+        ov = self.data["overrides"].get("serial", {})
+        out = []
+        for c in toml_cfgs:
+            name = str(c.get("name", "")).lower()
+            out.append({**c, "name": name, **ov.get(name, {})})
+        names = {c["name"] for c in out}
+        for name, c in sorted(self.data["serial"].items()):
+            if name not in names:
+                out.append({**c, "name": name})
+        return out
 
     def apply_overrides(self, server_cfg, ifaces):
         ov = self.data["overrides"]
@@ -465,6 +479,41 @@ def instruments_on(bus):
     return sorted(addrs)
 
 
+def inst_info(key, holders, aliases_by_key):
+    st = GW.STATS.get(key)
+    info = STATE.data["instruments"].get(key, {})
+    turn = GW.TURNS.get(key)
+    owner = waiting = None
+    if turn:
+        with turn.cond:
+            owner = turn.owner.client if turn.owner is not None else None
+            waiting = len(turn.waiters)
+    return {
+        "key": key, "aliases": sorted(aliases_by_key.get(key, [])),
+        "idn": info.get("idn", ""), "note": info.get("note", ""),
+        "ops": st["ops"] if st else 0, "errors": st["errors"] if st else 0,
+        "rate": rate(st) if st else 0, "last": st["last"] if st else None,
+        "last_client": st["last_client"] if st else "",
+        "last_error": st["last_error"] if st else "",
+        "bytes_in": st["bytes_in"] if st else 0, "bytes_out": st["bytes_out"] if st else 0,
+        "turn_owner": owner, "waiting": waiting or 0, "locked_by": holders.get(key),
+    }
+
+
+def serial_status(holders, aliases_by_key):
+    out = []
+    for name, si in sorted(GW.SERIALS.items()):
+        out.append({**inst_info(name, holders, aliases_by_key),
+                    "name": name, "state": "ready" if si.ser is not None else "not connected",
+                    "port": si.port, "present": os.path.exists(si.port),
+                    "settings": si.settings_text, "description": si.description,
+                    "origin": "web" if name in STATE.data["serial"] else "config file",
+                    "opens": si.opens, "serial_errors": si.serial_errors,
+                    "last_error": si.last_error, "busy": si.lock.locked(),
+                    "stb": bool(si.stb_query)})
+    return out
+
+
 def status():
     holders = lock_holders()
     aliases_by_key = collections.defaultdict(list)
@@ -476,26 +525,9 @@ def status():
         scan = SCAN.get(name, {})
         for addr in instruments_on(name):
             key = f"{name},{addr}"
-            st = GW.STATS.get(key)
-            info = STATE.data["instruments"].get(key, {})
-            turn = GW.TURNS.get(key)
-            owner = waiting = None
-            if turn:
-                with turn.cond:
-                    owner = turn.owner.client if turn.owner is not None else None
-                    waiting = len(turn.waiters)
-            insts.append({
-                "key": key, "addr": addr, "aliases": sorted(aliases_by_key.get(key, [])),
-                "idn": info.get("idn", ""), "note": info.get("note", ""),
-                "listening": addr in scan.get("addrs", []) if scan else None,
-                "no_eoi": addr in a.no_eoi,
-                "ops": st["ops"] if st else 0, "errors": st["errors"] if st else 0,
-                "rate": rate(st) if st else 0, "last": st["last"] if st else None,
-                "last_client": st["last_client"] if st else "",
-                "last_error": st["last_error"] if st else "",
-                "bytes_in": st["bytes_in"] if st else 0, "bytes_out": st["bytes_out"] if st else 0,
-                "turn_owner": owner, "waiting": waiting or 0, "locked_by": holders.get(key),
-            })
+            insts.append({**inst_info(key, holders, aliases_by_key), "addr": addr,
+                          "listening": addr in scan.get("addrs", []) if scan else None,
+                          "no_eoi": addr in a.no_eoi})
         ser = a.ser
         buses.append({
             "name": name, "state": "ready" if ser is not None else "not connected",
@@ -509,7 +541,8 @@ def status():
         })
     return {
         "host": os.uname().nodename, "version": GW.VERSION, "started": GW.STARTED_AT,
-        "now": time.time(), "buses": buses, "clients": clients(),
+        "now": time.time(), "buses": buses, "serial": serial_status(holders, aliases_by_key),
+        "clients": clients(),
         "health": HEALTH.snapshot(), "events": list(GW.EVENTS)[-8:],
         "fifo_hold_s": GW.FIFO_HOLD_S,
     }
@@ -551,8 +584,13 @@ def effective_config():
                        "ifc_on_open": a.ifc_on_open, "no_eoi": sorted(a.no_eoi),
                        "no_eoi_tmo_ms": a.no_eoi_tmo_ms, "auto_no_eoi": a.auto_no_eoi,
                        "overridden": sorted(ov.get("interface", {}).get(name, {}))})
+    serials = []
+    for name, si in sorted(GW.SERIALS.items()):
+        serials.append({"name": name, **si.config(),
+                        "origin": "web" if name in STATE.data["serial"] else "config file",
+                        "overridden": sorted(ov.get("serial", {}).get(name, {}))})
     return {
-        "config_file": CONFIG_PATH, "state_file": STATE.path,
+        "config_file": CONFIG_PATH, "state_file": STATE.path, "serial": serials,
         "server": {"fifo_hold_s": GW.FIFO_HOLD_S,
                    "log_level": logging.getLevelName(logging.getLogger().level),
                    "overridden": sorted(ov.get("server", {}))},
@@ -634,13 +672,143 @@ def reset_overrides(section):
         ov = STATE.data["overrides"]
         if section == "server":
             ov.pop("server", None)
+        elif section in GW.SERIALS:
+            ov.get("serial", {}).pop(section, None)
         else:
             ov.get("interface", {}).pop(section, None)
         STATE.save()
     return ["Overrides removed. The values from the config file apply after a restart"]
 
 
+def list_ports():
+    """USB serial ports with what uses them."""
+    used = {}
+    for n, a in GW.ADAPTERS.items():
+        if a.current_port:
+            used[os.path.realpath(a.current_port)] = f"AR488 {n}"
+    for n, si in GW.SERIALS.items():
+        used[os.path.realpath(si.port)] = f"RS-232 {n}"
+    out = []
+    for d in ("/dev/serial/by-id", "/dev/serial/by-path"):
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            path = os.path.join(d, f)
+            real = os.path.realpath(path)
+            out.append({"path": path, "dev": real, "kind": d.rsplit("-", 1)[-1],
+                        "name": f.replace("-if00-port0", "").replace("usb-", ""),
+                        "used_by": used.get(real, "")})
+    return out
+
+
+def serial_save(body):
+    """Add or change a serial instrument; applies at once (the port reopens)."""
+    name = str(body.get("name", "")).strip().lower()
+    cfg = {k: body[k] for k in GW.SERIAL_KEYS if k in body}
+    si = GW.SERIALS.get(name)
+    if si is None:
+        new = {"name": name, **cfg}
+        if name in STATE.data["aliases"]:
+            raise ValueError(f"{name!r} is already an alias")
+        si = GW.add_serial(new)               # validates
+        GW.RESERVED_PORTS.add(os.path.realpath(si.port))
+        with STATE.lock:
+            STATE.data["serial"][name] = {k: v for k, v in new.items() if k != "name"}
+            STATE.save()
+        log.info("RS-232 instrument %s added: %s %s", name, si.port, si.settings_text)
+        return f"{name} added"
+    merged = {"name": name, **si.config(), **cfg}
+    errs = GW.serial_config_errors(merged)
+    if errs:
+        raise ValueError("; ".join(errs))
+    with si.lock:
+        si.close()
+        si.configure(**cfg)
+    GW.RESERVED_PORTS.add(os.path.realpath(si.port))
+    with STATE.lock:
+        if name in STATE.data["serial"]:
+            STATE.data["serial"][name].update(cfg)
+        else:
+            STATE.data["overrides"].setdefault("serial", {}).setdefault(name, {}).update(cfg)
+        STATE.save()
+    log.info("RS-232 instrument %s changed: %s %s", name, si.port, si.settings_text)
+    return f"{name} saved; the port reopens on the next access"
+
+
+def serial_delete(name):
+    si = GW.SERIALS.get(name)
+    if si is None:
+        raise ValueError(f"no serial instrument {name}")
+    if name not in STATE.data["serial"]:
+        raise ValueError(f"{name} is defined in the config file; remove it there")
+    with si.lock:
+        si.close()
+    del GW.SERIALS[name]
+    with STATE.lock:
+        del STATE.data["serial"][name]
+        for k in [k for k, v in STATE.data["aliases"].items() if v == name]:
+            del STATE.data["aliases"][k]
+            GW.ALIASES.pop(k, None)
+        STATE.save()
+    log.info("RS-232 instrument %s deleted", name)
+
+
+PROBE_BAUDS = (9600, 19200, 38400, 57600, 115200, 4800, 2400, 1200, 300)
+
+
+def serial_probe(port, query="*IDN?"):
+    """Find speed and terminator by sending a query at common settings (8N1).
+    Sends data at wrong speeds too, so the instrument may log framing errors."""
+    import serial as pyserial
+    port = str(port)
+    real = os.path.realpath(port)
+    owner = next((si for si in GW.SERIALS.values() if os.path.realpath(si.port) == real), None)
+    with GW.PORT_LOCK:
+        busy = real in GW.PORTS_IN_USE
+    if busy and owner is None:
+        raise ValueError(f"{port} is used by an AR488 adapter")
+    lock = owner.lock if owner else threading.Lock()
+    with lock:
+        if owner:
+            owner.close()
+        with GW.PORT_LOCK:
+            GW.PORTS_IN_USE.add(real)
+        try:
+            with pyserial.Serial(port, PROBE_BAUDS[0], timeout=0.05) as s:
+                time.sleep(0.2)
+                for baud in PROBE_BAUDS:
+                    s.baudrate = baud
+                    for term in ("lf", "cr", "crlf"):
+                        t = GW.TERMS[term]
+                        s.write(t)
+                        time.sleep(0.1)
+                        s.reset_input_buffer()
+                        s.write(query.encode("latin-1") + t)
+                        s.flush()
+                        t0, buf = time.time(), b""
+                        while time.time() - t0 < 0.6 + 2000 / baud:
+                            buf += s.read(256)
+                            if len(buf) > 2 and buf.endswith((b"\r", b"\n")):
+                                break
+                        txt = buf.strip(b"\r\n")
+                        if len(txt) >= 3 and all(32 <= c < 127 for c in txt):
+                            ends = "crlf" if buf.endswith(b"\r\n") else "lfcr" if buf.endswith(b"\n\r") \
+                                else "cr" if buf.endswith(b"\r") else "lf"
+                            return {"baud": baud, "write_termination": term,
+                                    "reply_termination": ends, "reply": txt.decode("latin-1")}
+            return None
+        finally:
+            with GW.PORT_LOCK:
+                GW.PORTS_IN_USE.discard(real)
+
+
 def adapter_action(bus, action):
+    if bus in GW.SERIALS and action == "reopen":
+        si = GW.SERIALS[bus]
+        with si.lock:
+            si.close()
+            si.open()
+        return f"{bus} reopened: {si.port}, {si.settings_text}"
     a = GW.ADAPTERS.get(bus)
     if not a:
         raise ValueError(f"no bus {bus}")
@@ -692,6 +860,8 @@ def set_alias(key, alias, note):
                 raise ValueError(f"alias {a!r}: use letters, digits, - and _ (not gpib..., inst0)")
             if a in al and al[a] != key:
                 raise ValueError(f"alias {a!r} is already used for {al[a]}")
+            if a in GW.SERIALS:
+                raise ValueError(f"alias {a!r} is the name of a serial instrument")
             al[a] = key
             GW.ALIASES[a] = key
         if note is not None:
@@ -787,6 +957,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"events": list(GW.EVENTS)})
             if u.path == "/api/config":
                 return self._send(200, effective_config())
+            if u.path == "/api/ports":
+                return self._send(200, {"ports": list_ports()})
             if u.path == "/api/logger":
                 with JOBS_LOCK:
                     jobs = [JOBS[j["id"]].info() if j["id"] in JOBS else
@@ -889,6 +1061,14 @@ class Handler(BaseHTTPRequestHandler):
                     "stb": stb, "ms": round((time.monotonic() - t0) * 1000, 1)}
         if p == "/api/scan":
             return {"scan": scan_buses()}
+        if p == "/api/serial/save":
+            return {"ok": True, "message": serial_save(body)}
+        if p == "/api/serial/delete":
+            serial_delete(str(body["name"]))
+            return {"ok": True}
+        if p == "/api/serial/probe":
+            log.info("searching serial settings on %s (from %s)", body.get("port"), who)
+            return {"found": serial_probe(body["port"], str(body.get("query") or "*IDN?"))}
         if p == "/api/identify":
             key = registry().resolve(str(body["resource"]))
             cmd = str(body.get("cmd") or "*IDN?")

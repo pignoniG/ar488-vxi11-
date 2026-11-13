@@ -8,6 +8,8 @@ PyVISA/pyvisa-py, LabVIEW, MATLAB, python-vxi11, …) can reach them with:
 TCPIP::<pi-ip>::gpib0,16::INSTR      # bus gpib0, GPIB address 16 (Keithley 2000)
 TCPIP::<pi-ip>::gpib1,5::INSTR       # bus gpib1, GPIB address 5
 TCPIP::<pi-ip>::inst0::INSTR         # the gateway itself (see "Gateway queries")
+TCPIP::<pi-ip>::asrl0::INSTR         # an RS-232 instrument on a USB serial cable
+TCPIP::<pi-ip>::k2000::INSTR         # any instrument by an alias set on the web page
 ```
 
 ## Layout
@@ -75,6 +77,39 @@ present:
   20 ms wait at the end of each reply.
 * **256-byte input buffer** (`++rxbuf`): fewer round trips on long writes.
 
+## RS-232 instruments
+
+Instruments on USB-to-RS-232 cables work like GPIB instruments: same VXI-11
+resource style, FIFO queue, locks, console, logger, trace and aliases. Add them
+in `/etc/ar488-vxi11.toml` as `[[serial]]` (see the comments there) or on the
+web page (Settings → Add an RS-232 instrument). There, *Find settings* tries
+`*IDN?` at the common speeds and line ends.
+
+| name | instrument | port | settings |
+|---|---|---|---|
+| `asrl0` (alias `k2000`) | Keithley 2000 | Prolific PL2303 cable, `/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_CDCIj137C01-if00-port0` | 19200 8N1, sends LF, replies end in CR |
+
+* **Messages are lines.** The configured line end is appended to every write
+  (replacing any CR/LF the client sent), and a read returns one reply line
+  ending in LF, whatever the instrument uses ("auto" accepts CR, LF or both).
+  Clients therefore see the same thing as from a GPIB instrument.
+* **Serial poll** is emulated with a status query (`stb_query = "*STB?"`)
+  because RS-232 has none. **Go to local/remote** and **trigger** send the
+  configured commands (`:SYST:LOC`, `:SYST:REM`, `*TRG`). **Device clear**
+  flushes the buffers and sends `clear_cmd` if set. Operations with no command
+  configured return "not supported".
+* Use the `/dev/serial/by-id/...` port name: it identifies the cable by its USB
+  serial number, so any USB socket works. These ports are never probed for
+  AR488 adapters (probing sends `++ver` at 500000/115200 baud, which an
+  instrument would log as framing errors).
+* The port stays open; unplug/replug recovers on the next access.
+* Measured on the Keithley 2000 at 19200 baud: `:FETCH?` 24 ms, `*IDN?`
+  about 50 ms. Binary replies containing CR or LF bytes would be split, since
+  replies are lines.
+* The Keithley 2000 has one active interface. While it's set to RS-232, `gpib0,16`
+  doesn't answer: point the `k2000` alias at whichever one is active
+  (Instruments page).
+
 ## Web interface
 
 `http://gpibpi.local:8080/` (or the Pi's IP). It runs inside the gateway, so it
@@ -89,7 +124,7 @@ a LAN without internet, and it also works on a phone.
 | Logger | jobs that send a query at a fixed interval (optional setup command once at start), log the first number of each reply, and chart it with last, mean, std dev, min and max. CSV download. Jobs run in the gateway, so no PC needs to stay connected, and they survive restarts. |
 | Traffic | live trace of every operation on every instrument: client, data (first 160 bytes), duration, errors. Kept in memory, last 2000. |
 | Clients | connected VXI-11 clients, their instruments and locks. *Disconnect* frees a lock held by a crashed program. |
-| Settings | password; FIFO hold time and log level; per bus: pinned port, serial speed, no-EOI addresses and timeout, IFC on open; adapter actions (reopen, pulse IFC, store bus name in the adapter's EEPROM); settings backup and restore |
+| Settings | password; FIFO hold time and log level; per bus: pinned port, serial speed, no-EOI addresses and timeout, IFC on open; adapter actions (reopen, pulse IFC, store bus name in the adapter's EEPROM); RS-232 instruments: add, edit, delete, *Find settings*; list of USB serial ports and what uses them; settings backup and restore |
 | System | Pi undervoltage and throttling (now, since boot, events per hour/day), temperature, gateway CPU and memory, per-bus reconnects and serial errors, event log, restart |
 
 **Aliases** work in VISA resource strings: after naming `gpib0,16` `k2000`,
@@ -120,6 +155,7 @@ table below.
 | `*IDN?` | `AR488-VXI11,Gateway,<host>,<version>` |
 | `INTERFACES?` | `gpib0=<serial port>,gpib1=<serial port>` |
 | `VERSIONS?` | AR488 firmware version of each adapter |
+| `SERIAL?` | RS-232 instruments: `asrl0=<port>,19200 8N1` |
 | `LISTENERS?` / `LISTENERS? gpib0` | addresses that acknowledge on the bus, e.g. `gpib0=16;gpib1=9,22`. This is a GPIB-level check, so it finds instruments that answer no queries (HP 3456A). All buses are scanned at once (~0.2 s). A bus with nothing powered on gives an empty list (`gpib2=`). An adapter on old firmware reports `UNSUPPORTED`. |
 
 Tested through the gateway (PyVISA/pyvisa-py over the LAN, 2026-11-07, all

@@ -26,6 +26,32 @@ no_eoi = [9]            # HP 3245A: no EOI on replies unless sent "END ON"
 [[interface]]
 name = "gpib2"          # Nano clone (CH340): Agilent 54624A
 
+# RS-232 instruments on USB serial cables: TCPIP::<pi>::<name>::INSTR
+[[serial]]
+name = "asrl0"
+port = "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_CDCIj137C01-if00-port0"
+baud = 19200
+stb_query = "*STB?"     # RS-232 has no serial poll: the status byte is queried
+local_cmd = ":SYST:LOC"
+remote_cmd = ":SYST:REM"
+description = "Keithley 2000 (RS-232, Prolific cable)"
+
+# Settings of a [[serial]] instrument (defaults shown):
+# port = "/dev/serial/by-id/..."   # by-id follows the cable to any USB socket
+# baud = 9600
+# data_bits = 8
+# parity = "N"          # N, E, O, M, S
+# stop_bits = 1         # 1, 1.5, 2
+# flow = "none"         # none, xonxoff, rtscts, dsrdtr
+# write_termination = "lf"   # lf, cr, crlf, lfcr: appended to every command
+# read_termination = "auto"  # a reply ends at CR or LF (auto), or exactly lf, cr, crlf, lfcr
+# stb_query = ""        # e.g. "*STB?"; empty: serial poll not supported
+# trigger_cmd = "*TRG"
+# local_cmd = ""        # sent for VISA "go to local"
+# remote_cmd = ""
+# clear_cmd = ""        # device clear flushes the buffers and sends this, if set
+# The port of a [[serial]] instrument is never probed for AR488 adapters.
+
 # Optional per-interface settings:
 # port = "/dev/serial/by-id/..."  # fixed port instead of finding it by name
 # baud = 500000         # default: found automatically (500000, then 115200)

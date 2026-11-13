@@ -126,6 +126,8 @@ def free_ports():
         return []
     with PORT_LOCK:
         busy = set(PORTS_IN_USE)
+    # ports configured for RS-232 instruments: never send them AR488 probes
+    busy |= RESERVED_PORTS | {os.path.realpath(s.port) for s in list(SERIALS.values())}
     ports = (os.path.join(SERIAL_DIR, p) for p in sorted(os.listdir(SERIAL_DIR)))
     return [p for p in ports if os.path.realpath(p) not in busy]
 
@@ -496,6 +498,224 @@ class AR488Adapter:
         return self._run(f)
 
 
+class NotSupported(Exception):
+    pass
+
+
+# ---- RS-232 instruments -------------------------------------------------------
+SERIAL_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+PARITIES = {"N": serial.PARITY_NONE, "E": serial.PARITY_EVEN, "O": serial.PARITY_ODD,
+            "M": serial.PARITY_MARK, "S": serial.PARITY_SPACE}
+TERMS = {"lf": b"\n", "cr": b"\r", "crlf": b"\r\n", "lfcr": b"\n\r", "none": b""}
+SERIAL_KEYS = {"port": str, "baud": int, "data_bits": int, "parity": str, "stop_bits": float,
+               "flow": str, "write_termination": str, "read_termination": str,
+               "stb_query": str, "trigger_cmd": str, "local_cmd": str, "remote_cmd": str,
+               "clear_cmd": str, "description": str}
+
+
+def serial_config_errors(cfg):
+    """List of problems with a [[serial]] entry (empty if it's fine)."""
+    errs = []
+    if not SERIAL_NAME_RE.match(str(cfg.get("name", ""))) or NAME_RE.match(str(cfg.get("name", ""))) \
+            or str(cfg.get("name", "")).startswith("gpib") or cfg.get("name") == "inst0":
+        errs.append("name: letters, digits, - and _, starting with a letter (not gpib…, inst0)")
+    if not str(cfg.get("port", "")).startswith("/dev/"):
+        errs.append("port must be a /dev/... path (best: /dev/serial/by-id/...)")
+    for k in cfg:
+        if k not in SERIAL_KEYS and k != "name":
+            errs.append(f"unknown setting {k}")
+    if int(cfg.get("baud", 9600)) not in serial.Serial.BAUDRATES:
+        errs.append("baud: not a standard rate")
+    if int(cfg.get("data_bits", 8)) not in (5, 6, 7, 8):
+        errs.append("data_bits: 5 to 8")
+    if str(cfg.get("parity", "N")).upper()[:1] not in PARITIES:
+        errs.append("parity: N, E, O, M or S")
+    if float(cfg.get("stop_bits", 1)) not in (1, 1.5, 2):
+        errs.append("stop_bits: 1, 1.5 or 2")
+    if str(cfg.get("flow", "none")) not in ("none", "xonxoff", "rtscts", "dsrdtr"):
+        errs.append("flow: none, xonxoff, rtscts or dsrdtr")
+    if str(cfg.get("write_termination", "lf")) not in TERMS or cfg.get("write_termination") == "none":
+        errs.append("write_termination: lf, cr, crlf or lfcr")
+    if str(cfg.get("read_termination", "auto")) not in ("auto", "lf", "cr", "crlf", "lfcr"):
+        errs.append("read_termination: auto, lf, cr, crlf or lfcr")
+    return errs
+
+
+class SerialInstrument:
+    """One RS-232 instrument on a USB serial cable. Like an AR488 bus, the port
+    stays open and all access goes through self.lock.
+
+    Messages are lines: a write gets the instrument's terminator appended (any
+    CR/LF the client put at the end is replaced), and a read returns one line,
+    ending in LF whatever the instrument uses, so clients see GPIB-style replies."""
+
+    def __init__(self, name, port, baud=9600, data_bits=8, parity="N", stop_bits=1,
+                 flow="none", write_termination="lf", read_termination="auto",
+                 stb_query="", trigger_cmd="*TRG", local_cmd="", remote_cmd="",
+                 clear_cmd="", description=""):
+        self.name = name
+        self.lock = threading.Lock()
+        self.ser = None
+        self.current_port = None
+        self._real = None
+        self.opens = 0
+        self.serial_errors = 0
+        self.last_error = ""
+        self.opened_at = 0.0
+        self.configure(port=port, baud=baud, data_bits=data_bits, parity=parity,
+                       stop_bits=stop_bits, flow=flow, write_termination=write_termination,
+                       read_termination=read_termination, stb_query=stb_query,
+                       trigger_cmd=trigger_cmd, local_cmd=local_cmd, remote_cmd=remote_cmd,
+                       clear_cmd=clear_cmd, description=description)
+
+    def configure(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, SERIAL_KEYS[k](v) if k in SERIAL_KEYS and v is not None else v)
+        self.parity = self.parity.upper()[:1]
+        if self.stop_bits == int(self.stop_bits):
+            self.stop_bits = int(self.stop_bits)
+
+    def config(self):
+        return {k: getattr(self, k) for k in SERIAL_KEYS}
+
+    @property
+    def settings_text(self):
+        return f"{self.baud} {self.data_bits}{self.parity}{self.stop_bits}" + \
+            ("" if self.flow == "none" else f" {self.flow}")
+
+    def open(self):
+        self.close()
+        real = os.path.realpath(self.port)
+        with PORT_LOCK:
+            if real in PORTS_IN_USE:
+                raise AdapterError(f"{self.name}: {self.port} is already in use")
+            PORTS_IN_USE.add(real)
+        self._real = real
+        try:
+            self.ser = serial.Serial(
+                self.port, self.baud, bytesize=self.data_bits, parity=PARITIES[self.parity],
+                stopbits=self.stop_bits, xonxoff=self.flow == "xonxoff",
+                rtscts=self.flow == "rtscts", dsrdtr=self.flow == "dsrdtr",
+                timeout=0.02, write_timeout=10)
+        except BaseException:
+            self.close()
+            raise
+        self._rx = bytearray()          # bytes received after the last line
+        self._skip = None               # LF/CR to drop if it follows a CR/LF ("auto")
+        self.current_port = self.port
+        self.opens += 1
+        self.opened_at = time.time()
+        log.info("%s: opened %s, %s", self.name, self.port, self.settings_text)
+
+    def close(self):
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        self.ser = None
+        self.current_port = None
+        if self._real:
+            with PORT_LOCK:
+                PORTS_IN_USE.discard(self._real)
+            self._real = None
+
+    def _run(self, fn, *args):
+        with self.lock:
+            try:
+                if self.ser is None:
+                    self.open()
+                return fn(*args)
+            except SERIAL_ERRORS as e:
+                log.error("%s: serial error: %s", self.name, e)
+                self.serial_errors += 1
+                self.last_error = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {e}"
+                self.close()
+                raise AdapterError(f"{self.name}: {e}")
+
+    def _send(self, data):
+        # a new message: anything still unread belongs to an abandoned exchange
+        self.ser.reset_input_buffer()
+        self._rx.clear()
+        self._skip = None
+        self.ser.write(data)
+        self.ser.flush()
+
+    def write(self, data, end=True):
+        def f():
+            if end:
+                self._send(data.rstrip(b"\r\n") + TERMS[self.write_termination])
+            else:
+                self.ser.write(data)
+        self._run(f)
+
+    def command(self, cmd):
+        self._run(lambda: self._send(cmd.encode("latin-1") + TERMS[self.write_termination]))
+
+    def read(self, timeout_s):
+        """One line, returned with a single LF at the end."""
+        return self._run(self._readline, timeout_s)
+
+    def _readline(self, timeout_s):
+        """Caller holds self.lock (via _run)."""
+        deadline = time.monotonic() + timeout_s
+        rt = self.read_termination
+        while True:
+            if self._skip is not None and self._rx[:1] == self._skip:
+                del self._rx[:1]
+            if self._rx:
+                self._skip = None
+            if rt == "auto":
+                idx = [i for i in (self._rx.find(b"\r"), self._rx.find(b"\n")) if i >= 0]
+                if idx:
+                    i = min(idx)
+                    line, ch = bytes(self._rx[:i]), self._rx[i:i + 1]
+                    del self._rx[:i + 1]
+                    self._skip = b"\n" if ch == b"\r" else b"\r"
+                    return line + b"\n"
+            else:
+                t = TERMS[rt]
+                i = self._rx.find(t)
+                if i >= 0:
+                    line = bytes(self._rx[:i])
+                    del self._rx[:i + len(t)]
+                    return line + b"\n"
+            if time.monotonic() >= deadline:
+                raise ReadTimeout()
+            chunk = self.ser.read(self.ser.in_waiting or 1)
+            if chunk:
+                self._rx += chunk
+
+    def stb(self):
+        """Status byte by query (RS-232 has no serial poll), as one exchange."""
+        if not self.stb_query:
+            raise NotSupported()
+
+        def f():
+            self._send(self.stb_query.encode("latin-1") + TERMS[self.write_termination])
+            return self._readline(3.0)
+        r = self._run(f).strip()
+        try:
+            return int(float(r))
+        except ValueError:
+            raise AdapterError(f"{self.name}: bad reply to {self.stb_query}: {r!r}")
+
+    def simple(self, op):
+        cmd = {"clear": self.clear_cmd, "trigger": self.trigger_cmd, "local": self.local_cmd}[op]
+        if op == "clear":
+            def f():
+                self.ser.reset_output_buffer()
+                self._send(cmd.encode("latin-1") + TERMS[self.write_termination] if cmd else b"")
+            return self._run(f)
+        if not cmd:
+            raise NotSupported()
+        self.command(cmd)
+
+
+SERIALS = {}        # name -> SerialInstrument
+RESERVED_PORTS = set()  # real paths of serial instrument ports: never probed for AR488s
+
+
 ADAPTERS = {}       # "gpib0" -> AR488Adapter
 NAME_RE = re.compile(r"^\s*(gpib\d+)\s*,\s*(\d+)\s*(?:,\s*\d+\s*)?$", re.I)
 ALIASES = {}        # alias (lower case) -> "gpibN,addr"; managed by the web UI
@@ -692,9 +912,24 @@ class GpibDevice(Vxi11.InstrumentDevice):
         finally:
             self.turn.end(self, self._done)
 
+    # --- backend: what actually talks to the instrument (SerialDevice overrides these)
+    def _b_write(self, data, end):
+        self.adapter.write(self.addr, data, end)
+
+    def _b_read(self, timeout_s):
+        return self.adapter.read(self.addr, timeout_s)
+
+    def _b_stb(self):
+        return self.adapter.spoll(self.addr)
+
+    def _b_simple(self, op):
+        self.adapter.simple(self.addr, {"clear": "++clr", "trigger": "++trg", "local": "++loc"}[op])
+
     def _guard(self, fn, *a):
         try:
             return fn(*a)
+        except NotSupported:
+            return V.ERR_OPERATION_NOT_SUPPORTED
         except ReadTimeout:
             return V.ERR_IO_TIMEOUT
         except AdapterError as e:
@@ -719,7 +954,7 @@ class GpibDevice(Vxi11.InstrumentDevice):
             if not ok:
                 return V.ERR_IO_TIMEOUT
             self.pending = b""
-            r = self._guard(self.adapter.write, self.addr, opaque_data, end)
+            r = self._guard(self._b_write, opaque_data, end)
             self.write_ended = end
             if r is not None:
                 self._done = True
@@ -740,7 +975,7 @@ class GpibDevice(Vxi11.InstrumentDevice):
             if not ok:
                 return V.ERR_IO_TIMEOUT, 0, b""
             try:
-                self.pending = self.adapter.read(self.addr, max(io_timeout, 1) / 1000)
+                self.pending = self._b_read(max(io_timeout, 1) / 1000)
             except ReadTimeout:
                 self._done = True
                 return V.ERR_IO_TIMEOUT, 0, b""
@@ -761,11 +996,13 @@ class GpibDevice(Vxi11.InstrumentDevice):
     def device_readstb(self, flags, io_timeout):
         t0 = time.monotonic()
         try:
-            stb = self.adapter.spoll(self.addr)
+            stb = self._b_stb()
             self._note("stb", t0, got=str(stb).encode())
             return V.ERR_NO_ERROR, stb
-        except AdapterError as e:
-            log.error("%s: %s", self.device_name, e)
+        except NotSupported:
+            return V.ERR_OPERATION_NOT_SUPPORTED, 0
+        except (AdapterError, ReadTimeout) as e:
+            log.error("%s: %s", self.device_name, e or "timeout")
             self._note("stb", t0, r=V.ERR_IO_ERROR)
             return V.ERR_IO_ERROR, 0
 
@@ -776,7 +1013,7 @@ class GpibDevice(Vxi11.InstrumentDevice):
             if not ok:
                 return V.ERR_IO_TIMEOUT
             t0 = time.monotonic()
-            r = self._guard(self.adapter.simple, self.addr, "++clr")
+            r = self._guard(self._b_simple, "clear")
             self._done = True       # clear ends any exchange in progress
             self._note("clear", t0, r=r)
         return V.ERR_NO_ERROR if r is None else r
@@ -787,7 +1024,7 @@ class GpibDevice(Vxi11.InstrumentDevice):
             if not ok:
                 return V.ERR_IO_TIMEOUT
             t0 = time.monotonic()
-            r = self._guard(self.adapter.simple, self.addr, "++trg")
+            r = self._guard(self._b_simple, "trigger")
             if r is not None:
                 self._done = True
             self._note("trigger", t0, r=r)
@@ -795,7 +1032,7 @@ class GpibDevice(Vxi11.InstrumentDevice):
 
     def device_local(self, flags, io_timeout):
         t0 = time.monotonic()
-        r = self._guard(self.adapter.simple, self.addr, "++loc")
+        r = self._guard(self._b_simple, "local")
         self._note("local", t0, r=r)
         return V.ERR_NO_ERROR if r is None else r
 
@@ -804,6 +1041,35 @@ class GpibDevice(Vxi11.InstrumentDevice):
 
     def device_enable_srq(self, enable, handle):
         return V.ERR_OPERATION_NOT_SUPPORTED
+
+
+class SerialDevice(GpibDevice):
+    """VXI-11 link to an RS-232 instrument. Same queueing, locks and monitoring as
+    a GPIB instrument; only the backend differs."""
+
+    def device_init(self):
+        self.inst = SERIALS[self.device_name]
+        self.pending = b""
+        self.turn = instrument_turn(self.device_name)
+        self.write_ended = True
+
+    def _b_write(self, data, end):
+        self.inst.write(data, end)
+
+    def _b_read(self, timeout_s):
+        return self.inst.read(timeout_s)
+
+    def _b_stb(self):
+        return self.inst.stb()
+
+    def _b_simple(self, op):
+        self.inst.simple(op)
+
+    def device_remote(self, flags, io_timeout):
+        if self.inst.remote_cmd:
+            r = self._guard(self.inst.command, self.inst.remote_cmd)
+            return V.ERR_NO_ERROR if r is None else r
+        return V.ERR_NO_ERROR
 
 
 class GatewayInfoDevice(Vxi11.InstrumentDevice):
@@ -818,6 +1084,8 @@ class GatewayInfoDevice(Vxi11.InstrumentDevice):
             self.result = f"AR488-VXI11,Gateway,{os.uname().nodename},{VERSION}\n"
         elif cmd in ("*DEVICE_LIST?", "INTERFACES?"):
             self.result = ",".join(f"{n}={a.current_port or 'NOT FOUND'}" for n, a in sorted(ADAPTERS.items())) + "\n"
+        elif cmd == "SERIAL?":
+            self.result = ";".join(f"{n}={s.port},{s.settings_text}" for n, s in sorted(SERIALS.items())) + "\n"
         elif cmd == "VERSIONS?":
             self.result = ";".join(f"{n}={a.version}" for n, a in sorted(ADAPTERS.items())) + "\n"
         elif cmd.startswith("LISTENERS?"):
@@ -837,7 +1105,7 @@ class GatewayInfoDevice(Vxi11.InstrumentDevice):
                 parts = list(pool.map(lambda na: scan(*na), buses))
             self.result = (";".join(parts) if parts else f"ERROR: no interface {want}") + "\n"
         else:
-            self.result = "ERROR: supported: *IDN?, INTERFACES?, VERSIONS?, LISTENERS? [gpibN]\n"
+            self.result = "ERROR: supported: *IDN?, INTERFACES?, VERSIONS?, LISTENERS? [gpibN], SERIAL?\n"
         self.result = self.result.encode()
         return V.ERR_NO_ERROR
 
@@ -867,6 +1135,8 @@ class GatewayRegistry(IS.DeviceRegistry):
         if key == "inst0":
             return key
         key = ALIASES.get(key, key)
+        if key in SERIALS:
+            return key
         m = NAME_RE.match(key)
         if not m or m.group(1) not in ADAPTERS or not 0 <= int(m.group(2)) <= 30:
             raise KeyError(name)
@@ -876,12 +1146,20 @@ class GatewayRegistry(IS.DeviceRegistry):
         """The shared DeviceLock of an instrument (created if needed)."""
         with self._lock:
             if key not in self._registry:
-                self.register(key, GpibDevice)
+                self.register(key, SerialDevice if key in SERIALS else GpibDevice)
             return self._registry[key].lock
 
     def factory(self, name):
         key = name.strip().lower()
         key = ALIASES.get(key, key)
+        if key in SERIALS:
+            with self._lock:
+                if key not in self._registry or self._registry[key].device_class is not SerialDevice:
+                    self.register(key, SerialDevice)
+                item = self._registry[key]
+            dev = item.device_class(key, item.lock)
+            dev.device_list = self.directory()
+            return dev
         if key != "inst0":
             m = NAME_RE.match(key)
             if not m or m.group(1) not in ADAPTERS or not 0 <= int(m.group(2)) <= 30:
@@ -921,6 +1199,29 @@ def load_config(path):
     return cfg.get("server", {}), ifaces
 
 
+def load_serial_section(path):
+    """The [[serial]] entries of the config file."""
+    try:
+        with open(path, "rb") as f:
+            return [dict(x) for x in tomllib.load(f).get("serial", [])]
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+
+
+def add_serial(cfg):
+    """Create (not yet open) a serial instrument from a config dict. ValueError if invalid."""
+    cfg = {k: v for k, v in cfg.items() if v is not None}
+    errs = serial_config_errors(cfg)
+    if errs:
+        raise ValueError(f"serial {cfg.get('name')!r}: " + "; ".join(errs))
+    name = cfg.pop("name").lower()
+    if name in SERIALS or name in ALIASES:
+        raise ValueError(f"serial {name!r}: name already in use")
+    s = SerialInstrument(name, **cfg)
+    SERIALS[name] = s
+    return s
+
+
 def load_web_section(path):
     """The [web] table of the config file (port, bind, enabled, state_dir)."""
     try:
@@ -941,12 +1242,28 @@ def main():
     ev = EventLogHandler(logging.INFO)
     logging.getLogger("ar488-vxi11").addHandler(ev)
     logging.getLogger("webui").addHandler(ev)
+    # serial instrument ports are reserved before anything probes for AR488s
+    serial_cfgs = load_serial_section(args.config)
+    RESERVED_PORTS.update(os.path.realpath(str(c.get("port", ""))) for c in serial_cfgs if c.get("port"))
     server_cfg, ifaces = load_config(args.config)
     web_cfg = load_web_section(args.config)
     import webui
     state = webui.State(web_cfg.get("state_dir"))
     server_cfg, ifaces = state.apply_overrides(server_cfg, ifaces)
-    ALIASES.update(state.aliases())
+    serial_cfgs = state.apply_serial(serial_cfgs)
+    RESERVED_PORTS.update(os.path.realpath(str(c.get("port", ""))) for c in serial_cfgs if c.get("port"))
+    for c in serial_cfgs:
+        try:
+            add_serial(c)
+        except ValueError as e:
+            log.error("%s", e)
+    ALIASES.update({k: v for k, v in state.aliases().items() if k not in SERIALS})
+    for s in SERIALS.values():
+        try:
+            with s.lock:
+                s.open()
+        except Exception as e:
+            log.error("%s: can't open %s: %s (will retry on first access)", s.name, s.port, e)
     if not args.verbose:
         logging.getLogger().setLevel(server_cfg.get("log_level", "INFO").upper())
     global FIFO_HOLD_S
@@ -966,14 +1283,16 @@ def main():
         except Exception as e:      # keep going; it will be retried on first use
             log.error("%s: %s (will retry on first access)", a.name, e)
             a.close()
-    if not ADAPTERS:
-        log.error("no adapters configured or found")
+    if not ADAPTERS and not SERIALS:
+        log.error("no adapters or serial instruments configured or found")
         return 1
 
     IS.Vxi11Server._device_registry = GatewayRegistry()
     server = Vxi11.InstrumentServer(GatewayInfoDevice)
     server.listen()
-    log.info("VXI-11 gateway up: %s", ", ".join(f"{n} -> {a.current_port or 'NOT FOUND'}" for n, a in sorted(ADAPTERS.items())))
+    log.info("VXI-11 gateway up: %s", ", ".join(
+        [f"{n} -> {a.current_port or 'NOT FOUND'}" for n, a in sorted(ADAPTERS.items())] +
+        [f"{n} -> {s.current_port or 'NOT OPEN'} (RS-232 {s.settings_text})" for n, s in sorted(SERIALS.items())]))
     if web_cfg.get("enabled", True):
         try:
             webui.start(sys.modules[__name__], state, args.config, server_cfg,
@@ -990,7 +1309,7 @@ def main():
     except OSError as e:
         # at system shutdown rpcbind may already be gone: nothing to unregister from
         log.info("portmapper unregister skipped: %s", e)
-    for a in ADAPTERS.values():
+    for a in list(ADAPTERS.values()) + list(SERIALS.values()):
         a.close()
     return 0
 
